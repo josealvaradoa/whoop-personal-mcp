@@ -61,19 +61,28 @@ async function fetchWhoop<T>(
   return (await response.json()) as T;
 }
 
+const MAX_PAGES = 50;
+
 async function fetchAllPages<T>(
   endpoint: string,
   params?: Record<string, string>
 ): Promise<T[]> {
   const allRecords: T[] = [];
-  const queryParams = { ...params };
+  // WHOOP v2 caps page size at 25; requesting it explicitly cuts round-trips ~2.5x.
+  const queryParams: Record<string, string> = { ...params, limit: "25" };
+  let truncated = false;
 
-  for (let page_num = 0; page_num < 50; page_num++) {
+  for (let page_num = 0; page_num < MAX_PAGES; page_num++) {
     const page = await fetchWhoop<PaginatedResponse<T>>(endpoint, queryParams);
     allRecords.push(...page.records);
 
     if (!page.next_token || page.records.length === 0) break;
     queryParams.nextToken = page.next_token;
+    if (page_num === MAX_PAGES - 1) truncated = true;
+  }
+
+  if (truncated) {
+    console.warn(`[whoop-api] ${endpoint} hit the ${MAX_PAGES}-page cap — results were truncated.`);
   }
 
   return allRecords;
@@ -85,12 +94,14 @@ function cacheTtlSeconds(): number {
 
 // --- Date helpers ---
 
+/** ISO timestamp for N days before now. Note: calendar-day boundaries are UTC (documented limitation). */
 export function daysAgo(n: number): string {
   const d = new Date();
   d.setDate(d.getDate() - n);
   return d.toISOString();
 }
 
+/** ISO timestamp for now. Note: calendar-day boundaries are UTC (documented limitation). */
 export function today(): string {
   return new Date().toISOString();
 }

@@ -1,61 +1,66 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { daysAgo, today, getRecoveryCollection, getCycles } from "../../whoop/client.js";
-import { computeRecoveryTrend } from "../../compute/recovery.js";
+import { computeRecoveryTrend, toDailyRecovery } from "../../compute/recovery.js";
+import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
 
 export function registerRecoveryTool(server: McpServer): void {
-  server.registerTool(
+  defineTool(
+    server,
     "whoop_get_recovery_trend",
     {
       title: "Recovery Score Trend",
-      description: "Get recovery score trend over a time window. Includes 7-day and 30-day rolling averages, trend direction (improving/stable/declining), and consecutive green/yellow/red day counts.",
+      description:
+        "Get recovery score trend over a time window. Includes 7-day and 30-day rolling averages, trend direction (improving/stable/declining), and consecutive green/yellow/red day counts. Only WHOOP-scored days are included; averages and trend are null when there is no data for the window (null never means zero).",
       inputSchema: {
-        days: z.number().int().min(7).optional().default(30).describe("Number of days to look back. Minimum 7, default 30."),
+        days: z.number().int().min(7).max(365).optional().default(30).describe("Number of days to look back. Minimum 7, maximum 365, default 30."),
       },
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
+      outputSchema: {
+        raw: z.object({
+          daily_recovery: z.array(
+            z.object({
+              date: z.string(),
+              score: z.number(),
+              hrv_rmssd: z.number(),
+              resting_heart_rate: z.number(),
+            }),
+          ),
+        }),
+        computed: z.object({
+          avg_7d: z.number().nullable(),
+          avg_30d: z.number().nullable(),
+          trend: z.enum(["improving", "declining", "stable"]).nullable(),
+          consecutive_red_days: z.number(),
+          consecutive_yellow_days: z.number(),
+          consecutive_green_days: z.number(),
+        }),
       },
+      annotations: READ_ONLY_ANNOTATIONS,
+      errorLabel: "fetching recovery trend",
     },
     async ({ days }) => {
-      try {
-        const start = daysAgo(days);
-        const end = today();
-        const [recoveries, cycles] = await Promise.all([
-          getRecoveryCollection(start, end),
-          getCycles(start, end),
-        ]);
+      const start = daysAgo(days);
+      const end = today();
+      const [recoveries, cycles] = await Promise.all([
+        getRecoveryCollection(start, end),
+        getCycles(start, end),
+      ]);
 
-        const cycleDateMap = new Map(cycles.map((c) => [c.id, c.start.split("T")[0]]));
+      const cycleDates = new Map(cycles.map((c) => [c.id, c.start.split("T")[0]]));
+      const daily = toDailyRecovery(recoveries, cycleDates);
+      const computed = computeRecoveryTrend(daily);
 
-        const dailyRecovery = recoveries
-          .filter((r) => cycleDateMap.has(r.cycle_id))
-          .map((r) => ({
-            date: cycleDateMap.get(r.cycle_id)!,
-            score: r.score.recovery_score,
-            hrv_rmssd: r.score.hrv_rmssd_milli,
-            resting_heart_rate: r.score.resting_heart_rate,
-          }));
-
-        const computed = computeRecoveryTrend(recoveries);
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({ raw: { daily_recovery: dailyRecovery }, computed }, null, 2),
-            },
-          ],
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          isError: true,
-          content: [{ type: "text" as const, text: `Error fetching recovery trend: ${message}` }],
-        };
-      }
-    }
+      return {
+        raw: {
+          daily_recovery: daily.map((d) => ({
+            date: d.date,
+            score: d.recovery_score,
+            hrv_rmssd: d.hrv_rmssd,
+            resting_heart_rate: d.resting_heart_rate,
+          })),
+        },
+        computed,
+      };
+    },
   );
 }

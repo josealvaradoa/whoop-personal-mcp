@@ -1,25 +1,21 @@
-import type { Recovery } from "../whoop/types.js";
-import { mean, computeTrend, type Trend } from "./recovery.js";
+import { computeTrend, type Trend, type DailyRecovery } from "./recovery.js";
+import { mean, stddev, roundTo, dedupeByDay, windowByDays } from "./stats.js";
 
-function stddev(values: number[]): number {
-  if (values.length < 2) return 0;
-  const avg = mean(values);
-  const squaredDiffs = values.map((v) => (v - avg) ** 2);
-  return Math.sqrt(mean(squaredDiffs));
-}
+export function computeHrvTrend(daily: DailyRecovery[]) {
+  const buckets = dedupeByDay(daily, (d) => d.date, (a, b) => b.date.localeCompare(a.date));
 
-export function computeHrvTrend(recoveries: Recovery[]) {
-  const hrvValues = recoveries.map((r) => r.score.hrv_rmssd_milli);
+  const last7 = windowByDays(buckets, 7).map((b) => b.value.hrv_rmssd);
+  const last30 = windowByDays(buckets, 30).map((b) => b.value.hrv_rmssd);
 
-  const last7 = hrvValues.slice(0, 7);
-  const last30 = hrvValues.slice(0, 30);
-
-  const baseline30d = Math.round(mean(last30) * 10) / 10;
-  const current7dAvg = Math.round(mean(last7) * 10) / 10;
+  const mean7 = mean(last7);
+  const mean30 = mean(last30);
+  const baseline30d = mean30 == null ? null : roundTo(mean30, 1);
+  const current7dAvg = mean7 == null ? null : roundTo(mean7, 1);
   const sd = stddev(last7);
-  const cvPct = current7dAvg > 0 ? Math.round((sd / mean(last7)) * 1000) / 10 : 0;
-  const trend: Trend = computeTrend(mean(last7), mean(last30));
-  const aboveBaseline = current7dAvg > baseline30d;
+  const cvPct = sd != null && mean7 != null && mean7 > 0 ? roundTo((sd / mean7) * 100, 1) : null;
+  const trend: Trend | null = computeTrend(mean7, mean30);
+  const aboveBaseline =
+    current7dAvg != null && baseline30d != null ? current7dAvg > baseline30d : null;
 
   return {
     baseline_30d: baseline30d,

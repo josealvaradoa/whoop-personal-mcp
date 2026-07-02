@@ -33,19 +33,24 @@ export interface Cycle {
   } | null;
 }
 
+// Scoring state shared by recovery, sleep, and workout records. Only "SCORED"
+// records carry a populated `score`; the others must be filtered out before use.
+export type ScoreState = "SCORED" | "PENDING_SCORE" | "UNSCORABLE";
+
 // Recovery
 export interface Recovery {
   cycle_id: number;
   sleep_id: string;
   user_id: number;
-  score_state: string;
+  score_state: ScoreState;
+  // null until WHOOP finishes scoring (score_state !== "SCORED").
   score: {
     recovery_score: number;
     resting_heart_rate: number;
     hrv_rmssd_milli: number;
     spo2_percentage: number | null;
     skin_temp_celsius: number | null;
-  };
+  } | null;
 }
 
 // Sleep
@@ -54,6 +59,10 @@ export interface Sleep {
   user_id: number;
   start: string;
   end: string;
+  // WHOOP flags naps separately; nightly-sleep aggregates must exclude nap === true.
+  nap: boolean;
+  score_state: ScoreState;
+  // null until WHOOP finishes scoring (score_state !== "SCORED").
   score: {
     stage_summary: {
       total_in_bed_time_milli: number;
@@ -74,7 +83,7 @@ export interface Sleep {
     sleep_performance_percentage: number | null;
     sleep_consistency_percentage: number | null;
     sleep_efficiency_percentage: number | null;
-  };
+  } | null;
 }
 
 // Workout

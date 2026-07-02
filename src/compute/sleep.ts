@@ -1,14 +1,15 @@
 import { config } from "../config.js";
 import type { Sleep } from "../whoop/types.js";
-import { mean, computeTrend, type Trend } from "./recovery.js";
+import { computeTrend, type Trend } from "./recovery.js";
+import { mean, stddev, roundTo, dedupeByDay, windowByDays } from "./stats.js";
 
 const MILLI_TO_HRS = 1 / (1000 * 60 * 60);
 
-function stddev(values: number[]): number {
-  if (values.length < 2) return 0;
-  const avg = mean(values);
-  const squaredDiffs = values.map((v) => (v - avg) ** 2);
-  return Math.sqrt(mean(squaredDiffs));
+// A scored, non-nap sleep — the only kind that counts as a night of sleep.
+export type NightSleep = Sleep & { score: NonNullable<Sleep["score"]> };
+
+export function isNightSleep(s: Sleep): s is NightSleep {
+  return s.score_state === "SCORED" && s.score != null && !s.nap;
 }
 
 export interface SleepDayData {
@@ -25,7 +26,7 @@ export interface SleepDayData {
   };
 }
 
-export function mapSleepToDay(s: Sleep): SleepDayData {
+export function mapSleepToDay(s: NightSleep): SleepDayData {
   const ss = s.score.stage_summary;
   const totalSleep =
     ss.total_light_sleep_time_milli +
@@ -34,52 +35,50 @@ export function mapSleepToDay(s: Sleep): SleepDayData {
 
   return {
     date: s.start.split("T")[0],
-    duration_hrs: Math.round(totalSleep * MILLI_TO_HRS * 100) / 100,
+    duration_hrs: roundTo(totalSleep * MILLI_TO_HRS, 2),
     efficiency_pct: s.score.sleep_efficiency_percentage,
     performance_pct: s.score.sleep_performance_percentage,
     respiratory_rate: s.score.respiratory_rate,
     stages: {
-      awake_hrs: Math.round(ss.total_awake_time_milli * MILLI_TO_HRS * 100) / 100,
-      light_hrs: Math.round(ss.total_light_sleep_time_milli * MILLI_TO_HRS * 100) / 100,
-      slow_wave_hrs: Math.round(ss.total_slow_wave_sleep_time_milli * MILLI_TO_HRS * 100) / 100,
-      rem_hrs: Math.round(ss.total_rem_sleep_time_milli * MILLI_TO_HRS * 100) / 100,
+      awake_hrs: roundTo(ss.total_awake_time_milli * MILLI_TO_HRS, 2),
+      light_hrs: roundTo(ss.total_light_sleep_time_milli * MILLI_TO_HRS, 2),
+      slow_wave_hrs: roundTo(ss.total_slow_wave_sleep_time_milli * MILLI_TO_HRS, 2),
+      rem_hrs: roundTo(ss.total_rem_sleep_time_milli * MILLI_TO_HRS, 2),
     },
   };
 }
 
 export function computeSleepTrend(sleepDays: SleepDayData[]) {
-  const last7 = sleepDays.slice(0, 7);
-  const prev7 = sleepDays.slice(7, 14);
+  const buckets = dedupeByDay(sleepDays, (d) => d.date, (a, b) => b.date.localeCompare(a.date));
+  const last7 = windowByDays(buckets, 7).map((b) => b.value);
+  const prev7 = windowByDays(buckets, 7, 7).map((b) => b.value);
 
   const durations7d = last7.map((d) => d.duration_hrs);
   const efficiencies7d = last7
     .map((d) => d.efficiency_pct)
     .filter((e): e is number => e != null);
 
-  const avgDuration7d = Math.round(mean(durations7d) * 10) / 10;
-  const avgEfficiency7d = Math.round(mean(efficiencies7d));
+  const avgDuration = mean(durations7d);
+  const avgEfficiency = mean(efficiencies7d);
 
   const target = config.athlete.sleep_target_hrs;
   const sleepDebtCumulative =
-    Math.round(last7.reduce((sum, d) => sum + (d.duration_hrs - target), 0) * 10) / 10;
+    durations7d.length > 0
+      ? roundTo(durations7d.reduce((sum, d) => sum + (d - target), 0), 1)
+      : null;
 
   // Consistency: 1.0 - normalized stddev of sleep durations as proxy
-  let consistencyScore = 1.0;
-  if (durations7d.length >= 2) {
-    const durationStddev = stddev(durations7d);
-    const normalized = avgDuration7d > 0 ? durationStddev / avgDuration7d : 0;
-    consistencyScore = Math.round(Math.max(0, 1.0 - normalized) * 100) / 100;
+  let consistencyScore: number | null = null;
+  const durationStddev = stddev(durations7d);
+  if (durationStddev != null && avgDuration != null && avgDuration > 0) {
+    consistencyScore = roundTo(Math.max(0, 1.0 - durationStddev / avgDuration), 2);
   }
 
-  const prevDurations = prev7.map((d) => d.duration_hrs);
-  const trend: Trend =
-    prev7.length >= 3
-      ? computeTrend(mean(durations7d), mean(prevDurations))
-      : "stable";
+  const trend: Trend | null = computeTrend(avgDuration, mean(prev7.map((d) => d.duration_hrs)));
 
   return {
-    avg_duration_7d_hrs: avgDuration7d,
-    avg_efficiency_7d_pct: avgEfficiency7d,
+    avg_duration_7d_hrs: avgDuration == null ? null : roundTo(avgDuration, 1),
+    avg_efficiency_7d_pct: avgEfficiency == null ? null : Math.round(avgEfficiency),
     sleep_debt_cumulative_hrs: sleepDebtCumulative,
     consistency_score: consistencyScore,
     trend,
