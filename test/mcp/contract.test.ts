@@ -278,6 +278,22 @@ describe("MCP contract — a dirty workout degrades gracefully (fix 9)", () => {
     // volume sums the two good durations without NaN (60 + 60 = 2.0h).
     expect(sc.computed.weekly_volume_hrs).toBe(2);
   });
+
+  it("today_overview nulls a non-finite latest-recovery metric instead of failing (fix 9)", async () => {
+    const day = todayUtc();
+    const dirty = makeRecovery({ cycleId: 1, recoveryScore: 60, hrv: 70, rhr: 50 });
+    (dirty.score as Any).hrv_rmssd_milli = NaN; // NaN would be rejected by z.number().nullable()
+    mock = installWhoopMock({
+      cycles: [makeCycle({ date: day, id: 1 })],
+      recoveries: [dirty],
+    });
+    const res = await callTool("whoop_get_today_overview");
+    expect(res.isError, "a dirty latest recovery must not fail overview").toBeFalsy();
+    const sc = res.structuredContent;
+    expect(sc.raw.hrv_rmssd).toBeNull(); // NaN → null, not a rejected result
+    expect(sc.raw.recovery_score).toBe(60); // finite fields still flow through
+    expect(sc.computed.recovery_available).toBe(true);
+  });
 });
 
 describe("MCP contract — widened cycle window keeps a boundary recovery (fix 10)", () => {
