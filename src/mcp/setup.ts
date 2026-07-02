@@ -151,9 +151,10 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
       console.log(`New MCP session: ${transport.sessionId} (active: ${sessions.size})`);
     }
     } catch (err) {
+      // Log the detail server-side; return only a generic message to the client.
       console.error("POST /mcp error:", err);
       if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: String(err) }, id: null });
+        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
       }
     }
   });
@@ -170,9 +171,10 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
       session.lastActivity = Date.now();
       await session.transport.handleRequest(req, res);
     } catch (err) {
+      // Log the detail server-side; return only a generic message to the client.
       console.error("GET /mcp error:", err);
       if (!res.headersSent) {
-        res.status(500).json({ error: String(err) });
+        res.status(500).json({ error: "Internal server error" });
       }
     }
   });

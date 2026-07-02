@@ -18,9 +18,11 @@ export interface Config {
   };
   security: {
     encryptionSecret: string;
-    mcpBearerToken: string;
-    mcpOAuthClientId: string;
-    mcpOAuthClientSecret: string;
+    // Optional static bearer token for direct MCP access (curl/scripts). When
+    // unset there is no static auth path — only dynamic OAuth tokens are accepted.
+    mcpBearerToken: string | undefined;
+    // Browser password gating client authorization and WHOOP account linking.
+    accessPassword: string;
   };
   server: {
     port: number;
@@ -113,6 +115,11 @@ function buildConfig(): Config {
     throw new Error("ENCRYPTION_SECRET must be at least 32 characters");
   }
 
+  const accessPassword = requireEnv("ACCESS_PASSWORD");
+  if (accessPassword.length < 12) {
+    throw new Error("ACCESS_PASSWORD must be at least 12 characters");
+  }
+
   const raw = loadConfigFile();
   validateConfig(raw);
 
@@ -129,9 +136,8 @@ function buildConfig(): Config {
     },
     security: {
       encryptionSecret,
-      mcpBearerToken: requireEnv("MCP_BEARER_TOKEN"),
-      mcpOAuthClientId: requireEnv("MCP_OAUTH_CLIENT_ID"),
-      mcpOAuthClientSecret: requireEnv("MCP_OAUTH_CLIENT_SECRET"),
+      mcpBearerToken: process.env.MCP_BEARER_TOKEN || undefined,
+      accessPassword,
     },
     server: {
       port: parseInt(process.env.PORT ?? "3000", 10),

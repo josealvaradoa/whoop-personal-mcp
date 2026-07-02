@@ -1,6 +1,6 @@
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -24,6 +24,18 @@ interface PendingMcpAuth {
 }
 const pendingMcpAuth = new Map<string, PendingMcpAuth>();
 
+// Pending authorizations awaiting the resource owner's password (consent gate).
+// Keyed by a random consentId; single-use, 10-min TTL (STATE_TTL_MS).
+interface PendingConsent {
+  clientId: string;
+  clientName?: string;
+  redirectUri: string;
+  state?: string;
+  codeChallenge: string;
+  createdAt: number;
+}
+const pendingConsent = new Map<string, PendingConsent>();
+
 function cleanupStates(): void {
   const now = Date.now();
   for (const [state, created] of pendingStates) {
@@ -32,6 +44,47 @@ function cleanupStates(): void {
   for (const [state, data] of pendingMcpAuth) {
     if (now - data.createdAt > STATE_TTL_MS) pendingMcpAuth.delete(state);
   }
+  for (const [id, data] of pendingConsent) {
+    if (now - data.createdAt > STATE_TTL_MS) pendingConsent.delete(id);
+  }
+}
+
+// sha256 hex — used to store MCP tokens at rest so a DB leak yields no live credentials.
+function hashToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+// Constant-time secret comparison. Hashing both sides first makes the buffers
+// equal-length (timingSafeEqual throws on length mismatch) and hides input length.
+function secretsMatch(a: string, b: string): boolean {
+  return timingSafeEqual(
+    createHash("sha256").update(a).digest(),
+    createHash("sha256").update(b).digest()
+  );
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Only allow redirect URIs that are https, or http on localhost/127.0.0.1.
+function isAllowedRedirectUri(uri: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  return (
+    parsed.protocol === "http:" &&
+    (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")
+  );
 }
 
 // --- MCP OAuth: short-lived state in-memory, persistent state in SQLite ---
@@ -58,9 +111,11 @@ function dbRegisterClient(clientInfo: OAuthClientInformationFull): void {
     .run(clientInfo.client_id, JSON.stringify(clientInfo));
 }
 
+// MCP tokens are stored hashed (sha256). Incoming tokens are hashed before lookup;
+// the raw token is only ever handed back to the client that owns it.
 function dbGetAccessToken(token: string): { clientId: string; expiresAt: number } | undefined {
   const db = getDb();
-  const row = db.prepare("SELECT client_id, expires_at FROM mcp_access_tokens WHERE token = ?").get(token) as
+  const row = db.prepare("SELECT client_id, expires_at FROM mcp_access_tokens WHERE token = ?").get(hashToken(token)) as
     | { client_id: string; expires_at: number }
     | undefined;
   return row ? { clientId: row.client_id, expiresAt: row.expires_at } : undefined;
@@ -69,12 +124,12 @@ function dbGetAccessToken(token: string): { clientId: string; expiresAt: number 
 function dbSetAccessToken(token: string, clientId: string, expiresAt: number): void {
   const db = getDb();
   db.prepare("INSERT OR REPLACE INTO mcp_access_tokens (token, client_id, expires_at) VALUES (?, ?, ?)")
-    .run(token, clientId, expiresAt);
+    .run(hashToken(token), clientId, expiresAt);
 }
 
 function dbGetRefreshToken(token: string): { clientId: string; expiresAt: number } | undefined {
   const db = getDb();
-  const row = db.prepare("SELECT client_id, expires_at FROM mcp_refresh_tokens WHERE token = ?").get(token) as
+  const row = db.prepare("SELECT client_id, expires_at FROM mcp_refresh_tokens WHERE token = ?").get(hashToken(token)) as
     | { client_id: string; expires_at: number }
     | undefined;
   return row ? { clientId: row.client_id, expiresAt: row.expires_at } : undefined;
@@ -83,12 +138,12 @@ function dbGetRefreshToken(token: string): { clientId: string; expiresAt: number
 function dbSetRefreshToken(token: string, clientId: string, expiresAt: number): void {
   const db = getDb();
   db.prepare("INSERT OR REPLACE INTO mcp_refresh_tokens (token, client_id, expires_at) VALUES (?, ?, ?)")
-    .run(token, clientId, expiresAt);
+    .run(hashToken(token), clientId, expiresAt);
 }
 
 function dbDeleteRefreshToken(token: string): void {
   const db = getDb();
-  db.prepare("DELETE FROM mcp_refresh_tokens WHERE token = ?").run(token);
+  db.prepare("DELETE FROM mcp_refresh_tokens WHERE token = ?").run(hashToken(token));
 }
 
 // Cleanup expired tokens every 10 minutes
@@ -111,6 +166,13 @@ const clientsStore: OAuthRegisteredClientsStore = {
     return client;
   },
   registerClient(clientInfo: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">) {
+    // Defense in depth: only issue codes to https (or localhost) redirect targets.
+    for (const uri of clientInfo.redirect_uris) {
+      if (!isAllowedRedirectUri(uri)) {
+        console.error(`[auth] registerClient REJECTED — disallowed redirect_uri`);
+        throw new Error("redirect_uris must use https (http allowed only for localhost)");
+      }
+    }
     const clientId = randomBytes(16).toString("hex");
     const full: OAuthClientInformationFull = {
       ...clientInfo,
@@ -135,41 +197,20 @@ export const oauthProvider: OAuthServerProvider = {
     res: Response
   ): Promise<void> {
     console.log(`[auth] authorize called for client ${client.client_id.slice(0, 8)}…, redirectUri=${params.redirectUri}`);
-    // If Whoop tokens already exist, auto-approve immediately
-    if (getTokens()) {
-      const code = randomBytes(32).toString("hex");
-      authorizationCodes.set(code, {
-        clientId: client.client_id,
-        codeChallenge: params.codeChallenge,
-        redirectUri: params.redirectUri,
-        createdAt: Date.now(),
-      });
-
-      const url = new URL(params.redirectUri);
-      url.searchParams.set("code", code);
-      if (params.state) url.searchParams.set("state", params.state);
-
-      console.log(`[auth] Whoop tokens exist → auto-approve, redirecting to Claude`);
-      res.redirect(url.toString());
-      return;
-    }
-
-    // No Whoop tokens — chain to Whoop OAuth, then complete MCP auth on callback
-    console.log(`[auth] No Whoop tokens → chaining to Whoop OAuth`);
+    // Consent gate: never auto-approve. Stash the pending authorization and require
+    // the resource owner to prove ownership (ACCESS_PASSWORD) before any code is issued.
     cleanupStates();
-    const whoopState = randomBytes(16).toString("hex");
-    pendingStates.set(whoopState, Date.now());
-    pendingMcpAuth.set(whoopState, {
+    const consentId = randomBytes(16).toString("hex");
+    pendingConsent.set(consentId, {
       clientId: client.client_id,
+      clientName: client.client_name,
       redirectUri: params.redirectUri,
       state: params.state,
       codeChallenge: params.codeChallenge,
       createdAt: Date.now(),
     });
-
-    console.log(`[auth] pendingMcpAuth stored for state ${whoopState.slice(0, 8)}…, pendingStates size=${pendingStates.size}, pendingMcpAuth size=${pendingMcpAuth.size}`);
-    const whoopUrl = buildAuthUrl(whoopState);
-    sendAuthRedirectPage(res, whoopUrl);
+    console.log(`[auth] consent gate → rendering form for consentId ${consentId.slice(0, 8)}…`);
+    sendConsentPage(res, consentId, client.client_name);
   },
 
   async challengeForAuthorizationCode(
@@ -186,11 +227,16 @@ export const oauthProvider: OAuthServerProvider = {
     client: OAuthClientInformationFull,
     authorizationCode: string,
     _codeVerifier?: string,
-    _redirectUri?: string
+    redirectUri?: string
   ): Promise<OAuthTokens> {
     const data = authorizationCodes.get(authorizationCode);
     if (!data || data.clientId !== client.client_id) {
       console.error(`[auth] exchangeAuthorizationCode FAILED — code ${data ? "found but clientId mismatch" : "NOT FOUND"}`);
+      throw new Error("Invalid authorization code");
+    }
+    // Bind the redirect_uri to the one the code was issued for (when supplied).
+    if (redirectUri !== undefined && redirectUri !== data.redirectUri) {
+      console.error(`[auth] exchangeAuthorizationCode FAILED — redirect_uri mismatch`);
       throw new Error("Invalid authorization code");
     }
     console.log(`[auth] exchangeAuthorizationCode → success, issuing access + refresh tokens`);
@@ -254,8 +300,9 @@ export const oauthProvider: OAuthServerProvider = {
       };
     }
 
-    // Check static bearer token
-    if (token === config.security.mcpBearerToken) {
+    // Check static bearer token (only when one is configured)
+    const staticToken = config.security.mcpBearerToken;
+    if (staticToken && secretsMatch(token, staticToken)) {
       console.log(`[auth] verifyAccessToken → static bearer token`);
       return {
         token,
@@ -316,19 +363,119 @@ function sendAuthRedirectPage(res: Response, whoopUrl: string): void {
 </html>`);
 }
 
+/**
+ * Renders a dark-styled password form (same visual language as
+ * sendAuthRedirectPage).  Used by both the client-consent gate and the
+ * WHOOP account-linking flow.  All interpolated values are HTML-escaped —
+ * `title`/`description` can carry an attacker-controlled `client_name`.
+ */
+function sendPasswordPage(
+  res: Response,
+  opts: {
+    action: string;
+    title: string;
+    description: string;
+    hidden?: Record<string, string>;
+    error?: string;
+  }
+): void {
+  const hiddenInputs = Object.entries(opts.hidden ?? {})
+    .map(([k, v]) => `<input type="hidden" name="${escapeHtml(k)}" value="${escapeHtml(v)}">`)
+    .join("");
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.status(opts.error ? 401 : 200).send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(opts.title)}</title>
+  <style>
+    body{font-family:system-ui,-apple-system,sans-serif;display:flex;
+         align-items:center;justify-content:center;min-height:100vh;
+         margin:0;background:#0f0f0f;color:#fff;text-align:center}
+    .card{max-width:400px;padding:2rem;width:100%;box-sizing:border-box}
+    h2{margin:0 0 .5rem}
+    p{color:#ccc}
+    form{margin-top:1.5rem}
+    input[type=password]{width:100%;box-sizing:border-box;padding:.75rem;
+         border-radius:8px;border:1px solid #333;background:#1a1a1a;color:#fff;font-size:1rem}
+    button{width:100%;padding:.75rem;margin-top:1rem;border:none;border-radius:8px;
+         background:#44d62c;color:#000;font-weight:700;font-size:1rem;cursor:pointer}
+    button:hover{background:#3ac024}
+    .err{color:#ff5555;font-size:.9rem;margin-top:1rem}
+    .hint{color:#999;font-size:.85rem;margin-top:1.5rem}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>${escapeHtml(opts.title)}</h2>
+    <p>${escapeHtml(opts.description)}</p>
+    <form method="post" action="${escapeHtml(opts.action)}">
+      ${hiddenInputs}
+      <input type="password" name="password" placeholder="Access password" autofocus required autocomplete="current-password">
+      <button type="submit">Continue</button>
+      ${opts.error ? `<p class="err">${escapeHtml(opts.error)}</p>` : ""}
+    </form>
+    <p class="hint">This password protects access to your WHOOP data.</p>
+  </div>
+</body>
+</html>`);
+}
+
+// Renders the client-consent gate form (POSTs to /auth/consent with a single-use consentId).
+function sendConsentPage(res: Response, consentId: string, clientName?: string, error?: string): void {
+  const who = clientName ? `"${clientName}"` : "An application";
+  sendPasswordPage(res, {
+    action: "/auth/consent",
+    title: "Authorize access",
+    description: `${who} wants to connect to your WHOOP data. Enter your access password to approve.`,
+    hidden: { consentId },
+    error,
+  });
+}
+
+const WHOOP_LINK_FORM = {
+  action: "/auth/whoop",
+  title: "Link your WHOOP account",
+  description: "Enter your access password to link your WHOOP account.",
+} as const;
+
 export function createApp(): express.Express {
   const app = express();
 
   // Trust proxy (Railway runs behind a reverse proxy)
   app.set("trust proxy", 1);
 
-  // CORS
-  app.use((_req: Request, res: Response, next: NextFunction) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+  // CORS — reflect an allowlisted Origin instead of a blanket wildcard.
+  // Defaults: claude.ai / claude.com + any localhost origin; CORS_ORIGINS adds more.
+  const corsAllowlist = new Set([
+    "https://claude.ai",
+    "https://claude.com",
+    ...(process.env.CORS_ORIGINS ?? "")
+      .split(",")
+      .map((o) => o.trim())
+      .filter(Boolean),
+  ]);
+  const isAllowedOrigin = (origin: string): boolean => {
+    if (corsAllowlist.has(origin)) return true;
+    try {
+      const { hostname } = new URL(origin);
+      return hostname === "localhost" || hostname === "127.0.0.1";
+    } catch {
+      return false;
+    }
+  };
+
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const origin = req.headers.origin;
+    res.setHeader("Vary", "Origin");
+    if (origin && isAllowedOrigin(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
     res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
-    if (_req.method === "OPTIONS") {
+    if (req.method === "OPTIONS") {
       res.status(204).end();
       return;
     }
@@ -351,10 +498,13 @@ export function createApp(): express.Express {
     res.json({ status: "ok" });
   });
 
-  // Whoop auth status — requires static bearer token to prevent info leak
+  // Whoop auth status — requires the static bearer token to prevent info leak.
+  // When no static token is configured, this endpoint is 401 for everything.
   app.get("/auth/status", (req: Request, res: Response) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || authHeader !== `Bearer ${config.security.mcpBearerToken}`) {
+    const staticToken = config.security.mcpBearerToken;
+    const authHeader = req.headers.authorization ?? "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!staticToken || !provided || !secretsMatch(provided, staticToken)) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -370,8 +520,81 @@ export function createApp(): express.Express {
     });
   });
 
-  // Start Whoop OAuth flow
+  // Consent gate — validate ACCESS_PASSWORD, then complete the pending MCP authorization.
+  app.post("/auth/consent", (req: Request, res: Response) => {
+    const body = req.body as { consentId?: unknown; password?: unknown };
+    const consentId = typeof body.consentId === "string" ? body.consentId : "";
+    const password = typeof body.password === "string" ? body.password : "";
+
+    // Single use: look up and delete immediately.
+    const pending = pendingConsent.get(consentId);
+    if (pending) pendingConsent.delete(consentId);
+
+    if (!pending) {
+      console.error(`[auth] /auth/consent REJECTED — consentId ${consentId ? "expired/unknown" : "missing"}`);
+      res.status(400).send("Consent request expired. Please restart the connection from your client.");
+      return;
+    }
+
+    if (!secretsMatch(password, config.security.accessPassword)) {
+      // Re-arm a fresh single-use consentId carrying the same pending params.
+      cleanupStates();
+      const freshId = randomBytes(16).toString("hex");
+      pendingConsent.set(freshId, { ...pending, createdAt: Date.now() });
+      console.error(`[auth] /auth/consent REJECTED — wrong password (re-armed ${freshId.slice(0, 8)}…)`);
+      sendConsentPage(res, freshId, pending.clientName, "Incorrect password. Please try again.");
+      return;
+    }
+
+    console.log(`[auth] /auth/consent OK — client ${pending.clientId.slice(0, 8)}… approved`);
+
+    // If WHOOP tokens already exist, issue the MCP authorization code now.
+    if (getTokens()) {
+      const code = randomBytes(32).toString("hex");
+      authorizationCodes.set(code, {
+        clientId: pending.clientId,
+        codeChallenge: pending.codeChallenge,
+        redirectUri: pending.redirectUri,
+        createdAt: Date.now(),
+      });
+      const url = new URL(pending.redirectUri);
+      url.searchParams.set("code", code);
+      if (pending.state) url.searchParams.set("state", pending.state);
+      console.log(`[auth] Whoop tokens exist → issuing code, redirecting to client`);
+      res.redirect(url.toString());
+      return;
+    }
+
+    // No WHOOP tokens — chain to WHOOP OAuth, then complete MCP auth on callback.
+    console.log(`[auth] No Whoop tokens → chaining to Whoop OAuth`);
+    cleanupStates();
+    const whoopState = randomBytes(16).toString("hex");
+    pendingStates.set(whoopState, Date.now());
+    pendingMcpAuth.set(whoopState, {
+      clientId: pending.clientId,
+      redirectUri: pending.redirectUri,
+      state: pending.state,
+      codeChallenge: pending.codeChallenge,
+      createdAt: Date.now(),
+    });
+    console.log(`[auth] pendingMcpAuth stored for state ${whoopState.slice(0, 8)}…, pendingStates size=${pendingStates.size}, pendingMcpAuth size=${pendingMcpAuth.size}`);
+    const whoopUrl = buildAuthUrl(whoopState);
+    sendAuthRedirectPage(res, whoopUrl);
+  });
+
+  // Start Whoop OAuth flow — gated behind the access password.
   app.get("/auth/whoop", (_req: Request, res: Response) => {
+    sendPasswordPage(res, { ...WHOOP_LINK_FORM });
+  });
+
+  app.post("/auth/whoop", (req: Request, res: Response) => {
+    const body = req.body as { password?: unknown };
+    const password = typeof body.password === "string" ? body.password : "";
+    if (!secretsMatch(password, config.security.accessPassword)) {
+      console.error(`[auth] POST /auth/whoop REJECTED — wrong password`);
+      sendPasswordPage(res, { ...WHOOP_LINK_FORM, error: "Incorrect password. Please try again." });
+      return;
+    }
     cleanupStates();
     const state = randomBytes(16).toString("hex");
     pendingStates.set(state, Date.now());
@@ -436,17 +659,19 @@ export function createApp(): express.Express {
         </body></html>
       `);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
+      // Log the detail server-side; return only a generic message to the client.
       console.error(`[callback] ERROR:`, err);
-      res.status(500).send(`Authorization failed: ${message}`);
+      if (!res.headersSent) {
+        res.status(500).send("Authorization failed");
+      }
     }
   });
 
-  // Global error handler — log unhandled errors
+  // Global error handler — log the detail, return a generic message.
   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
     console.error("Unhandled error:", err);
     if (!res.headersSent) {
-      res.status(500).json({ error: "Internal server error", message: err.message });
+      res.status(500).json({ error: "Internal server error" });
     }
   });
 

@@ -16,11 +16,6 @@ export function set(key: string, value: unknown, ttlSeconds: number): void {
   ).run(key, JSON.stringify(value), ttlSeconds);
 }
 
-export function invalidate(keyPrefix: string): void {
-  const db = getDb();
-  db.prepare("DELETE FROM cache WHERE key LIKE ?").run(keyPrefix + "%");
-}
-
 export function cleanup(): void {
   const db = getDb();
   db.prepare("DELETE FROM cache WHERE cached_at + ttl_seconds < unixepoch()").run();
