@@ -8,7 +8,7 @@ import {
   computeRecoveryTrend,
   computeBaselineComparison,
 } from "../../src/compute/recovery.js";
-import { makeRecovery, consecutiveRecovery } from "../helpers/fixtures.js";
+import { makeRecovery, consecutiveRecovery, makeDailyRecovery, shiftDay } from "../helpers/fixtures.js";
 
 const D = "2026-06-15";
 
@@ -84,6 +84,7 @@ describe("computeRecoveryTrend", () => {
       consecutive_red_days: 0,
       consecutive_yellow_days: 0,
       consecutive_green_days: 0,
+      as_of_date: null,
     });
   });
 
@@ -102,6 +103,51 @@ describe("computeRecoveryTrend", () => {
     const daily = consecutiveRecovery(D, [20, 25, 30, 70]);
     const r = computeRecoveryTrend(daily);
     expect(r.consecutive_red_days).toBe(3);
+  });
+
+  it("does NOT count calendar-gapped red readings as a streak (fix 2)", () => {
+    // Three red readings scattered over 11 days (D, D-5, D-10) are NOT a 3-day streak;
+    // a gap after the newest day ends it. This is the false-critical-fatigue bug.
+    const daily = [
+      makeDailyRecovery({ date: D, recoveryScore: 20 }),
+      makeDailyRecovery({ date: shiftDay(D, -5), recoveryScore: 25 }),
+      makeDailyRecovery({ date: shiftDay(D, -10), recoveryScore: 30 }),
+    ];
+    const r = computeRecoveryTrend(daily);
+    expect(r.consecutive_red_days).toBe(1); // was 3 before the calendar-adjacency fix
+  });
+
+  it("extends the streak only across adjacent days, stopping at the first gap (fix 2)", () => {
+    // Red on D and D-1 (adjacent) → streak 2; the gap before D-6 stops it there.
+    const daily = [
+      makeDailyRecovery({ date: D, recoveryScore: 20 }),
+      makeDailyRecovery({ date: shiftDay(D, -1), recoveryScore: 22 }),
+      makeDailyRecovery({ date: shiftDay(D, -6), recoveryScore: 24 }),
+    ];
+    expect(computeRecoveryTrend(daily).consecutive_red_days).toBe(2);
+  });
+
+  it("reports as_of_date as the newest day with data (fix 4)", () => {
+    const daily = consecutiveRecovery(D, [70, 68, 40]);
+    expect(computeRecoveryTrend(daily).as_of_date).toBe(D);
+    expect(computeRecoveryTrend([]).as_of_date).toBeNull();
+  });
+
+  it("drops a 'scored' record carrying a non-finite numeric instead of failing (fix 9)", () => {
+    // A dirty SCORED recovery (null hrv) must not flow a null into a z.number() field.
+    const cycleDates = new Map([
+      [1, "2026-06-10"],
+      [2, "2026-06-11"],
+    ]);
+    const dirty = makeRecovery({ cycleId: 2, recoveryScore: 50 });
+    // Simulate WHOOP returning a scored record with a missing numeric.
+    (dirty.score as { hrv_rmssd_milli: number }).hrv_rmssd_milli = NaN;
+    const daily = toDailyRecovery(
+      [makeRecovery({ cycleId: 1, recoveryScore: 70, hrv: 85, rhr: 48 }), dirty],
+      cycleDates,
+    );
+    expect(daily).toHaveLength(1);
+    expect(daily[0].date).toBe("2026-06-10");
   });
 
   it("detects a declining trend (recent 7d well below the 30d window)", () => {

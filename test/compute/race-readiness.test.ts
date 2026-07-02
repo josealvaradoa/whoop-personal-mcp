@@ -6,7 +6,9 @@ import {
   buildWeeklySummary,
   getDaysToRace,
   getCurrentPhase,
+  weeklyWorkoutVolumeHrs,
 } from "../../src/compute/race-readiness.js";
+import { makeWorkout } from "../helpers/fixtures.js";
 
 describe("computeFitnessTrend", () => {
   it("returns null when the ACWR zone is unknown", () => {
@@ -147,6 +149,32 @@ describe("buildWeeklySummary", () => {
     expect(s).toContain("Recovery trend is unavailable (insufficient recent data).");
     expect(s).not.toContain("ACWR is"); // null ACWR is omitted entirely
     expect(s).toContain("Continue current plan.");
+  });
+});
+
+describe("weeklyWorkoutVolumeHrs (fix 6 — SCORED workouts only)", () => {
+  it("sums only SCORED workouts; unscored activities never inflate volume", () => {
+    const workouts = [
+      makeWorkout({ date: "2026-06-15", durationMin: 60 }), // SCORED → 1.0h
+      makeWorkout({ date: "2026-06-14", durationMin: 90, scoreState: "PENDING_SCORE" }), // excluded
+      makeWorkout({ date: "2026-06-13", durationMin: 30 }), // SCORED → 0.5h
+    ];
+    // Only the two SCORED workouts count: 60 + 30 min = 1.5h (the 90-min pending is out).
+    expect(weeklyWorkoutVolumeHrs(workouts)).toBe(1.5);
+  });
+
+  it("is a real 0 (never NaN) when there are no scored workouts", () => {
+    expect(weeklyWorkoutVolumeHrs([])).toBe(0);
+    expect(
+      weeklyWorkoutVolumeHrs([makeWorkout({ date: "2026-06-15", scoreState: "PENDING_SCORE" })]),
+    ).toBe(0);
+  });
+
+  it("skips a workout with a non-finite duration (bad timestamp) rather than NaN-ing the sum", () => {
+    const good = makeWorkout({ date: "2026-06-15", durationMin: 60 });
+    const badTs = makeWorkout({ date: "2026-06-14", durationMin: 60 });
+    (badTs as { end: string }).end = "not-a-timestamp";
+    expect(weeklyWorkoutVolumeHrs([good, badTs])).toBe(1); // only the good 60-min workout
   });
 });
 

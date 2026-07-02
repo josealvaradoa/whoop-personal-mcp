@@ -13,7 +13,7 @@ export function registerWorkoutsTool(server: McpServer): void {
     {
       title: "Workout History",
       description:
-        "Get workout history with sport type, strain, duration, heart rate data, and HR zone distribution. Includes weekly volume and intensity analysis. Only WHOOP-scored workouts are included; counts and totals are zero only when no matching workouts were logged (they are never fabricated from missing data).",
+        "Get workout history with sport type, strain, duration, heart rate data, and HR zone distribution. Includes weekly volume and intensity analysis. Only WHOOP-scored workouts are included; counts and totals are zero only when no matching workouts were logged (they are never fabricated from missing data). avg_hr/max_hr are null when WHOOP did not record them. A single dirty record (e.g. a bad timestamp) is dropped rather than failing the whole request.",
       inputSchema: {
         days: z.number().int().min(1).max(365).optional().default(14).describe("Number of days to look back. Minimum 1, maximum 365, default 14."),
         sport: z.string().optional().describe("Filter by sport name (e.g. 'running', 'cycling', 'swimming'). Optional."),
@@ -26,8 +26,8 @@ export function registerWorkoutsTool(server: McpServer): void {
               sport: z.string(),
               strain: z.number(),
               duration_min: z.number(),
-              avg_hr: z.number(),
-              max_hr: z.number(),
+              avg_hr: z.number().nullable(),
+              max_hr: z.number().nullable(),
               calories: z.number(),
               hr_zones_minutes: z.object({
                 zone1: z.number(),
@@ -57,7 +57,17 @@ export function registerWorkoutsTool(server: McpServer): void {
     async ({ days, sport }) => {
       const workouts = await getWorkoutCollection(daysAgo(days), today());
 
-      // Map to readable format — filter out unscored workouts
+      const isFiniteNum = (n: unknown): n is number =>
+        typeof n === "number" && Number.isFinite(n);
+      const nullIfNotFinite = (n: unknown): number | null => (isFiniteNum(n) ? n : null);
+      // A missing zone breakdown is genuinely 0 minutes in that zone, not a fabricated
+      // metric — coerce non-finite millis to 0 so one dirty field can't NaN the record.
+      const zoneMin = (milli: unknown): number =>
+        isFiniteNum(milli) ? Math.round(milli * MILLI_TO_MIN) : 0;
+
+      // Map to readable format — filter out unscored workouts. One dirty record must
+      // degrade gracefully (dropped or nulled), never fail the whole tool: a NaN in a
+      // non-nullable z.number() field would make the SDK reject the entire result.
       const mapped = workouts
         .filter((w) => w.score_state === "SCORED" && w.score)
         .map((w) => {
@@ -65,23 +75,34 @@ export function registerWorkoutsTool(server: McpServer): void {
           const durationMin = Math.round(
             (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60)
           );
+          // Core numerics must be finite to aggregate honestly. A bad timestamp (NaN
+          // duration) or dirty strain/kilojoule drops just this workout.
+          if (
+            !isFiniteNum(durationMin) ||
+            !isFiniteNum(w.score.strain) ||
+            !isFiniteNum(w.score.kilojoule)
+          ) {
+            return null;
+          }
           return {
             date: w.start.split("T")[0],
             sport: w.sport_name,
             strain: w.score.strain,
             duration_min: durationMin,
-            avg_hr: w.score.average_heart_rate,
-            max_hr: w.score.max_heart_rate,
+            // avg/max HR are genuinely optional on WHOOP → emit null (NaN would be rejected).
+            avg_hr: nullIfNotFinite(w.score.average_heart_rate),
+            max_hr: nullIfNotFinite(w.score.max_heart_rate),
             calories: kjToKcal(w.score.kilojoule),
             hr_zones_minutes: {
-              zone1: Math.round(zd.zone_one_milli * MILLI_TO_MIN),
-              zone2: Math.round(zd.zone_two_milli * MILLI_TO_MIN),
-              zone3: Math.round(zd.zone_three_milli * MILLI_TO_MIN),
-              zone4: Math.round(zd.zone_four_milli * MILLI_TO_MIN),
-              zone5: Math.round(zd.zone_five_milli * MILLI_TO_MIN),
+              zone1: zoneMin(zd?.zone_one_milli),
+              zone2: zoneMin(zd?.zone_two_milli),
+              zone3: zoneMin(zd?.zone_three_milli),
+              zone4: zoneMin(zd?.zone_four_milli),
+              zone5: zoneMin(zd?.zone_five_milli),
             },
           };
-        });
+        })
+        .filter((w): w is NonNullable<typeof w> => w !== null);
 
       // Filter by sport if specified
       const filtered = sport

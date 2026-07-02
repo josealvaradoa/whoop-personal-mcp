@@ -1,6 +1,24 @@
 import { config } from "../config.js";
+import type { Workout } from "../whoop/types.js";
+import { roundTo } from "./stats.js";
 import type { Trend } from "./recovery.js";
 import type { AcwrZone } from "./training-load.js";
+
+// Weekly training volume in hours. Only SCORED workouts count (mirrors the workouts
+// tool) — an unscored/in-progress activity must not inflate volume — and non-finite
+// durations (bad timestamps) are skipped rather than poisoning the sum with NaN.
+export function weeklyWorkoutVolumeHrs(workouts: Workout[]): number {
+  return roundTo(
+    workouts
+      .filter((w) => w.score_state === "SCORED" && w.score)
+      .reduce((sum, w) => {
+        const dur =
+          (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60 * 60);
+        return Number.isFinite(dur) ? sum + dur : sum;
+      }, 0),
+    1,
+  );
+}
 
 export type FitnessTrend = "on_track" | "undertrained" | "overreaching" | "injury_risk";
 export type FatigueStatus = "fresh" | "manageable" | "accumulating" | "critical";

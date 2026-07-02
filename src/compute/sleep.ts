@@ -34,7 +34,10 @@ export function mapSleepToDay(s: NightSleep): SleepDayData {
     ss.total_rem_sleep_time_milli;
 
   return {
-    date: s.start.split("T")[0],
+    // Date the night by its WAKE day (s.end) so it aligns with the recovery/cycle
+    // day it belongs to — recovery is dated by cycle-day, and a night that starts
+    // before midnight but ends after belongs to the morning it wakes into.
+    date: s.end.split("T")[0],
     duration_hrs: roundTo(totalSleep * MILLI_TO_HRS, 2),
     efficiency_pct: s.score.sleep_efficiency_percentage,
     performance_pct: s.score.sleep_performance_percentage,
@@ -50,6 +53,7 @@ export function mapSleepToDay(s: NightSleep): SleepDayData {
 
 export function computeSleepTrend(sleepDays: SleepDayData[]) {
   const buckets = dedupeByDay(sleepDays, (d) => d.date, (a, b) => b.date.localeCompare(a.date));
+  const asOfDate = buckets.length > 0 ? buckets[0].date : null;
   const last7 = windowByDays(buckets, 7).map((b) => b.value);
   const prev7 = windowByDays(buckets, 7, 7).map((b) => b.value);
 
@@ -82,5 +86,6 @@ export function computeSleepTrend(sleepDays: SleepDayData[]) {
     sleep_debt_cumulative_hrs: sleepDebtCumulative,
     consistency_score: consistencyScore,
     trend,
+    as_of_date: asOfDate,
   };
 }

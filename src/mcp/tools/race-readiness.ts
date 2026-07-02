@@ -6,7 +6,6 @@ import { computeRecoveryTrend, toDailyRecovery } from "../../compute/recovery.js
 import { computeHrvTrend } from "../../compute/hrv.js";
 import { mapSleepToDay, computeSleepTrend, isNightSleep } from "../../compute/sleep.js";
 import { computeTrainingLoad } from "../../compute/training-load.js";
-import { roundTo } from "../../compute/stats.js";
 import {
   getDaysToRace,
   getCurrentPhase,
@@ -14,6 +13,7 @@ import {
   computeFatigueStatus,
   computeKeyConcerns,
   buildWeeklySummary,
+  weeklyWorkoutVolumeHrs,
 } from "../../compute/race-readiness.js";
 import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
 
@@ -68,14 +68,8 @@ export function registerRaceReadinessTool(server: McpServer): void {
       const sleepDays = sleeps.filter(isNightSleep).map(mapSleepToDay);
       const sleepResult = computeSleepTrend(sleepDays);
 
-      // Weekly volume
-      const weeklyVolumeHrs = roundTo(
-        workouts.reduce((sum, w) => {
-          const dur = (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60 * 60);
-          return sum + dur;
-        }, 0),
-        1,
-      );
+      // Weekly volume — SCORED workouts only (see weeklyWorkoutVolumeHrs).
+      const weeklyVolumeHrs = weeklyWorkoutVolumeHrs(workouts);
 
       const currentPhase = getCurrentPhase();
       const fitnessTrend = computeFitnessTrend(trainingLoad.acwr_zone, recoveryResult.trend);

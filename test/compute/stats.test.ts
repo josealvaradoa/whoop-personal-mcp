@@ -3,6 +3,7 @@ import {
   mean,
   stddev,
   roundTo,
+  dayDiff,
   kjToKcal,
   KJ_TO_KCAL,
   dedupeByDay,
@@ -50,6 +51,26 @@ describe("roundTo", () => {
   it("leaves whole numbers untouched", () => {
     expect(roundTo(42, 2)).toBe(42);
   });
+  it("returns null (never a fabricated 0) for null input", () => {
+    // Guards Math.round(null * factor) === 0 — a latent fabricated zero. (fix 7)
+    expect(roundTo(null, 2)).toBeNull();
+    expect(roundTo(null, 0)).toBeNull();
+  });
+  it("does not treat a genuine 0 as missing", () => {
+    expect(roundTo(0, 2)).toBe(0);
+  });
+});
+
+describe("dayDiff", () => {
+  it("counts whole UTC calendar days from b to a (a − b)", () => {
+    expect(dayDiff("2026-06-15", "2026-06-14")).toBe(1); // a is the next day
+    expect(dayDiff("2026-06-15", "2026-06-15")).toBe(0);
+    expect(dayDiff("2026-06-14", "2026-06-15")).toBe(-1);
+    expect(dayDiff("2026-06-15", "2026-06-05")).toBe(10);
+  });
+  it("crosses month boundaries correctly", () => {
+    expect(dayDiff("2026-07-01", "2026-06-30")).toBe(1);
+  });
 });
 
 describe("kjToKcal / KJ_TO_KCAL", () => {
@@ -81,6 +102,19 @@ describe("dedupeByDay", () => {
 
   it("returns an empty array for empty input", () => {
     expect(dedupeByDay([], (r: { day: string }) => r.day, () => 0)).toEqual([]);
+  });
+
+  it("with a date-only order, same-day ties fall back to INPUT order (not latest-wins)", () => {
+    // Recovery/sleep carry only a YYYY-MM-DD date (no intra-day timestamp), so their
+    // order compares by day alone; the first record seen for a day wins (stable sort).
+    // This documents the corrected dedupeByDay comment.
+    const records = [
+      { date: "2026-01-01", id: "first" },
+      { date: "2026-01-01", id: "second" },
+    ];
+    const out = dedupeByDay(records, (r) => r.date, (x, y) => y.date.localeCompare(x.date));
+    expect(out).toHaveLength(1);
+    expect(out[0].value.id).toBe("first"); // input order, not any timestamp tiebreak
   });
 });
 

@@ -12,6 +12,7 @@ describe("computeHrvTrend", () => {
       cv_pct: null,
       trend: null,
       above_baseline: null,
+      as_of_date: null,
     });
   });
 
@@ -39,5 +40,10 @@ describe("computeHrvTrend", () => {
     const r = computeHrvTrend(consecutiveRecovery(D, Array(30).fill(60), hrvs));
     expect(r.above_baseline).toBe(false);
     expect(r.trend).toBe("declining");
+  });
+
+  it("reports as_of_date as the newest day with data (fix 4)", () => {
+    expect(computeHrvTrend(consecutiveRecovery(D, [60, 60])).as_of_date).toBe(D);
+    expect(computeHrvTrend([]).as_of_date).toBeNull();
   });
 });

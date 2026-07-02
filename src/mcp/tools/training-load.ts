@@ -1,8 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { daysAgo, today, getCycles } from "../../whoop/client.js";
-import { computeTrainingLoad } from "../../compute/training-load.js";
-import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
+import { computeTrainingLoad, completedStrainByDay } from "../../compute/training-load.js";
+import { defineTool, READ_ONLY_ANNOTATIONS, daysSinceUTC } from "./helpers.js";
 
 export function registerTrainingLoadTool(server: McpServer): void {
   defineTool(
@@ -11,7 +11,7 @@ export function registerTrainingLoadTool(server: McpServer): void {
     {
       title: "Training Load Analysis",
       description:
-        "Get training load analysis: 7-day acute load, 28-day chronic load, acute-to-chronic workload ratio (ACWR), training monotony, and trend direction. Critical for injury prevention and periodization decisions. In-progress (unfinished) days are excluded; days_with_data_7d/28d report completeness, and acwr/acwr_zone are null when fewer than 4 of the last 7 days have data. A null field means no data, never zero.",
+        "Get training load analysis: 7-day acute load, 28-day chronic load, acute-to-chronic workload ratio (ACWR), training monotony, and trend direction. Critical for injury prevention and periodization decisions. In-progress (unfinished) days are excluded; days_with_data_7d/28d report completeness. ACWR needs an adequate chronic base: acwr/acwr_zone are null when fewer than 4 of the last 7 days OR fewer than 14 of the last 28 days have data (a returning athlete without a real chronic baseline gets null, not a fake 'optimal'). monotony is null when the last 7 days are too sparse to be meaningful. as_of_date is the most recent day with completed data; if days_since_last_data is more than a day or two the figures are stale. A null field means no data, never zero.",
       inputSchema: {
         days: z.number().int().min(28).max(365).optional().default(42).describe("Number of days of strain history to use for calculation. Minimum 28, maximum 365, default 42."),
       },
@@ -34,6 +34,8 @@ export function registerTrainingLoadTool(server: McpServer): void {
           trend_direction: z.enum(["building", "maintaining", "tapering", "deloading"]).nullable(),
           days_with_data_7d: z.number(),
           days_with_data_28d: z.number(),
+          as_of_date: z.string().nullable(),
+          days_since_last_data: z.number().nullable(),
         }),
       },
       annotations: READ_ONLY_ANNOTATIONS,
@@ -42,16 +44,18 @@ export function registerTrainingLoadTool(server: McpServer): void {
     async ({ days }) => {
       const cycles = await getCycles(daysAgo(days), today());
 
-      const dailyStrain = cycles.map((c) => ({
-        date: c.start.split("T")[0],
-        strain: c.score?.strain ?? null,
-      }));
+      // Build raw from the same completed + deduped buckets the aggregates use, so
+      // raw and computed agree and no in-progress / unscored / duplicate-day row leaks.
+      const dailyStrain = completedStrainByDay(cycles);
 
       const computed = computeTrainingLoad(cycles);
 
       return {
         raw: { daily_strain: dailyStrain },
-        computed,
+        computed: {
+          ...computed,
+          days_since_last_data: daysSinceUTC(computed.as_of_date),
+        },
       };
     },
   );

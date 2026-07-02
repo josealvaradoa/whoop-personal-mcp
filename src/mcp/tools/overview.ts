@@ -11,7 +11,7 @@ import {
 } from "../../compute/recovery.js";
 import { mapSleepToDay, isNightSleep } from "../../compute/sleep.js";
 import { kjToKcal, roundTo } from "../../compute/stats.js";
-import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
+import { defineTool, READ_ONLY_ANNOTATIONS, CYCLE_DATING_BUFFER_DAYS } from "./helpers.js";
 
 export function registerOverviewTool(server: McpServer): void {
   defineTool(
@@ -58,8 +58,12 @@ export function registerOverviewTool(server: McpServer): void {
       const end = today();
       const start30d = daysAgo(30);
 
+      // Widen the cycle window a few days earlier than the recovery window so this
+      // morning's recovery can still be dated by its cycle even if that cycle's start
+      // falls just before the tight daysAgo(1) boundary (see fix 10). Otherwise a
+      // boundary recovery is silently dropped and recovery_available wrongly reads false.
       const [cycles, recoveries, sleeps, recoveries30d] = await Promise.all([
-        getCycles(start, end),
+        getCycles(daysAgo(1 + CYCLE_DATING_BUFFER_DAYS), end),
         getRecoveryCollection(start, end),
         getSleepCollection(start, end),
         getRecoveryCollection(start30d, end),
@@ -71,8 +75,15 @@ export function registerOverviewTool(server: McpServer): void {
       const latestCycle = [...cycles].sort((a, b) => b.start.localeCompare(a.start))[0] ?? null;
       const cycleDate = latestCycle ? latestCycle.start.split("T")[0] : null;
       const dayInProgress = latestCycle ? latestCycle.end === null : false;
-      const strain = latestCycle?.score ? latestCycle.score.strain : null;
-      const calories = latestCycle?.score ? kjToKcal(latestCycle.score.kilojoule) : null;
+
+      // A single non-finite numeric from WHOOP must degrade to null, never NaN: a NaN
+      // in a z.number().nullable() field is STILL rejected by the SDK (nullable only
+      // permits null), which would fail the whole tool. Coerce every raw numeric here.
+      const fin = (n: number | null | undefined): number | null =>
+        typeof n === "number" && Number.isFinite(n) ? n : null;
+
+      const strain = fin(latestCycle?.score ? latestCycle.score.strain : null);
+      const calories = fin(latestCycle?.score ? kjToKcal(latestCycle.score.kilojoule) : null);
 
       // Most recent scored recovery, dated via its cycle.
       const datedRecoveries = recoveries
@@ -82,32 +93,37 @@ export function registerOverviewTool(server: McpServer): void {
         .sort((a, b) => b.date.localeCompare(a.date));
       const latestRecovery = datedRecoveries[0] ?? null;
 
-      const recoveryScore = latestRecovery ? latestRecovery.rec.score.recovery_score : null;
-      const hrvRmssd = latestRecovery ? latestRecovery.rec.score.hrv_rmssd_milli : null;
-      const rhr = latestRecovery ? latestRecovery.rec.score.resting_heart_rate : null;
-      const spo2 = latestRecovery ? latestRecovery.rec.score.spo2_percentage : null;
-      const skinTemp = latestRecovery ? latestRecovery.rec.score.skin_temp_celsius : null;
+      const recoveryScore = fin(latestRecovery ? latestRecovery.rec.score.recovery_score : null);
+      const hrvRmssd = fin(latestRecovery ? latestRecovery.rec.score.hrv_rmssd_milli : null);
+      const rhr = fin(latestRecovery ? latestRecovery.rec.score.resting_heart_rate : null);
+      const spo2 = fin(latestRecovery ? latestRecovery.rec.score.spo2_percentage : null);
+      const skinTemp = fin(latestRecovery ? latestRecovery.rec.score.skin_temp_celsius : null);
 
       // Most recent night of sleep (naps excluded).
       const latestNight =
         sleeps.filter(isNightSleep).sort((a, b) => b.start.localeCompare(a.start))[0] ?? null;
       const sleepDay = latestNight ? mapSleepToDay(latestNight) : null;
-      const sleepDate = latestNight ? latestNight.start.split("T")[0] : null;
-      const sleepPerfPct = latestNight ? latestNight.score.sleep_performance_percentage : null;
-      const sleepEffPct = latestNight ? latestNight.score.sleep_efficiency_percentage : null;
+      // Date the night by its WAKE day so sleep_date lines up with recovery_date /
+      // cycle_date (the morning this sleep belongs to), consistent with the compute layer.
+      const sleepDate = latestNight ? latestNight.end.split("T")[0] : null;
+      const sleepPerfPct = fin(latestNight ? latestNight.score.sleep_performance_percentage : null);
+      const sleepEffPct = fin(latestNight ? latestNight.score.sleep_efficiency_percentage : null);
+      const sleepDurationHrs = fin(sleepDay ? sleepDay.duration_hrs : null);
 
       const readiness = recoveryScore != null ? getReadiness(recoveryScore) : null;
       const recommendation = readiness != null ? getRecommendation(readiness) : null;
 
       const scored30d = recoveries30d.filter(isScoredRecovery);
-      const hrvValues30d = scored30d.map((r) => r.score.hrv_rmssd_milli);
-      const rhrValues30d = scored30d.map((r) => r.score.resting_heart_rate);
+      // Filter the 30-day baselines to finite values so one dirty record can't NaN the mean.
+      const hrvValues30d = scored30d.map((r) => r.score.hrv_rmssd_milli).filter(Number.isFinite);
+      const rhrValues30d = scored30d.map((r) => r.score.resting_heart_rate).filter(Number.isFinite);
 
       const hrvVsBaseline = computeBaselineComparison(hrvRmssd, hrvValues30d);
       const rhrVsBaseline = computeBaselineComparison(rhr, rhrValues30d);
-      const lastNightVsTarget = sleepDay
-        ? roundTo(sleepDay.duration_hrs - config.athlete.sleep_target_hrs, 1)
-        : null;
+      const lastNightVsTarget =
+        sleepDurationHrs != null
+          ? roundTo(sleepDurationHrs - config.athlete.sleep_target_hrs, 1)
+          : null;
 
       return {
         raw: {
@@ -121,7 +137,7 @@ export function registerOverviewTool(server: McpServer): void {
           spo2_pct: spo2,
           skin_temp_celsius: skinTemp,
           sleep_performance_pct: sleepPerfPct,
-          sleep_duration_hrs: sleepDay ? sleepDay.duration_hrs : null,
+          sleep_duration_hrs: sleepDurationHrs,
           sleep_efficiency_pct: sleepEffPct,
           day_strain: strain,
           day_calories: calories,

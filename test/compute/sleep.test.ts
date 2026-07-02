@@ -50,6 +50,18 @@ describe("mapSleepToDay", () => {
       rem_hrs: 1.5,
     });
   });
+
+  it("dates a night by its WAKE day, not its start day (fix 8)", () => {
+    // A night that starts the evening before but ends in the morning of D belongs to
+    // D — the same day its recovery/cycle is dated by — so trends align.
+    const crossMidnight = {
+      ...makeSleep({ date: D }),
+      start: `${shiftDay(D, -1)}T22:30:00.000Z`,
+      end: `${D}T06:15:00.000Z`,
+    };
+    const mapped = [crossMidnight].filter(isNightSleep).map(mapSleepToDay)[0];
+    expect(mapped.date).toBe(D); // wake day, not the start day (D-1)
+  });
 });
 
 describe("computeSleepTrend", () => {
@@ -60,6 +72,7 @@ describe("computeSleepTrend", () => {
       sleep_debt_cumulative_hrs: null,
       consistency_score: null,
       trend: null,
+      as_of_date: null,
     });
   });
 
@@ -103,5 +116,10 @@ describe("computeSleepTrend", () => {
   it("detects an improving duration trend vs the previous week", () => {
     const days = consecutiveSleepDays(D, [...Array(7).fill(9), ...Array(7).fill(6)]);
     expect(computeSleepTrend(days).trend).toBe("improving");
+  });
+
+  it("reports as_of_date as the newest sleep day (fix 4)", () => {
+    expect(computeSleepTrend(consecutiveSleepDays(D, [8, 8])).as_of_date).toBe(D);
+    expect(computeSleepTrend([]).as_of_date).toBeNull();
   });
 });

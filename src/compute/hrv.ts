@@ -3,6 +3,7 @@ import { mean, stddev, roundTo, dedupeByDay, windowByDays } from "./stats.js";
 
 export function computeHrvTrend(daily: DailyRecovery[]) {
   const buckets = dedupeByDay(daily, (d) => d.date, (a, b) => b.date.localeCompare(a.date));
+  const asOfDate = buckets.length > 0 ? buckets[0].date : null;
 
   const last7 = windowByDays(buckets, 7).map((b) => b.value.hrv_rmssd);
   const last30 = windowByDays(buckets, 30).map((b) => b.value.hrv_rmssd);
@@ -23,5 +24,6 @@ export function computeHrvTrend(daily: DailyRecovery[]) {
     cv_pct: cvPct,
     trend,
     above_baseline: aboveBaseline,
+    as_of_date: asOfDate,
   };
 }
