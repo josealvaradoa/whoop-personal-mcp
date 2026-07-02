@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import request from "supertest";
 import type { Express } from "express";
 import { useIsolatedDataDir, initTestDb, seedWhoopTokens } from "../helpers/db.js";
@@ -67,6 +67,26 @@ describe("Dynamic client registration", () => {
     const res = await registerClient("http://evil.example.com/callback");
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(res.body.client_id).toBeUndefined();
+  });
+
+  it("rejects an https redirect_uri on a non-allowed host (anti-phishing)", async () => {
+    const res = await registerClient("https://evil.example/cb");
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body.client_id).toBeUndefined();
+  });
+
+  it("rejects a look-alike host that is not an exact match", async () => {
+    for (const uri of ["https://claude.ai.evil.com/cb", "https://sub.claude.ai.evil.com/cb"]) {
+      const res = await registerClient(uri);
+      expect(res.status, `should reject ${uri}`).toBeGreaterThanOrEqual(400);
+      expect(res.body.client_id).toBeUndefined();
+    }
+  });
+
+  it("accepts an https redirect_uri on an allowed Claude host", async () => {
+    const res = await registerClient("https://claude.ai/api/mcp/auth_callback");
+    expect(res.status).toBe(201);
+    expect(res.body.client_id).toBeTruthy();
   });
 });
 
@@ -170,6 +190,25 @@ describe("OAuth happy path: register → authorize → consent → token → /mc
   });
 });
 
+describe("Consent page transparency", () => {
+  it("shows the concrete redirect_uri host so the owner sees where data goes", async () => {
+    const reg = await registerClient();
+    const { challenge } = generatePkce();
+    const res = await request(app).get("/authorize").query({
+      response_type: "code",
+      client_id: reg.body.client_id as string,
+      redirect_uri: REDIRECT_URI,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+      state: "state-transparency",
+    });
+    expect(res.status).toBe(200);
+    // The destination host (claude.ai) is rendered on the consent page.
+    expect(res.text).toContain("This will send your data to:");
+    expect(res.text).toContain(new URL(REDIRECT_URI).host); // "claude.ai"
+  });
+});
+
 describe("Consent gate — negatives", () => {
   it("rejects the wrong password (re-renders the form, no redirect, no code)", async () => {
     seedWhoopTokens();
@@ -231,6 +270,41 @@ describe("Consent gate — negatives", () => {
     expect(res.status).toBe(200);
     expect(res.text).toContain("api.prod.whoop.com/oauth");
     expect(res.headers.location).toBeUndefined();
+  });
+});
+
+describe("Authorization code TTL", () => {
+  it("rejects an expired authorization code at token exchange", async () => {
+    seedWhoopTokens();
+    const reg = await registerClient();
+    const clientId = reg.body.client_id as string;
+    const { verifier, challenge } = generatePkce();
+    const consentId = await getConsentId(clientId, challenge, "state-expired");
+    const consent = await request(app)
+      .post("/auth/consent")
+      .type("form")
+      .send({ consentId, password: PASSWORD });
+    expect(consent.status).toBe(302);
+    const code = new URL(consent.headers.location as string).searchParams.get("code");
+    expect(code).toBeTruthy();
+
+    // Advance Date past AUTH_CODE_TTL_MS (5 min) so the code is stale at exchange.
+    // Only Date is faked so express/supertest async (real timers) still works.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 6 * 60 * 1000);
+      const tok = await request(app).post("/token").type("form").send({
+        grant_type: "authorization_code",
+        code: code as string,
+        code_verifier: verifier,
+        client_id: clientId,
+        redirect_uri: REDIRECT_URI,
+      });
+      expect(tok.status).toBeGreaterThanOrEqual(400);
+      expect(tok.body.access_token).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -312,16 +386,17 @@ describe("MCP transport — auth & session negatives", () => {
     expect(res.status).toBe(400);
   });
 
-  // BUG (documented, not fixed): the static-bearer path in verifyAccessToken
-  // (src/server.ts:304-312) returns an AuthInfo with no `expiresAt`, but the SDK's
-  // requireBearerAuth (v1.27.1) rejects any token whose expiresAt is not a number
-  // ("Token has no expiration time"). So the static MCP_BEARER_TOKEN — the documented
-  // curl/testing path — can never authenticate an /mcp request. This asserts the
-  // CURRENT (buggy) behavior so the regression is captured; see final report.
-  it("static MCP_BEARER_TOKEN is currently rejected at /mcp (no expiresAt) — see BUG note", async () => {
-    const res = await request(app)
+  // FIXED: verifyAccessToken's static-bearer path now returns an AuthInfo with a
+  // (perpetually-refreshed) expiresAt, so the SDK's requireBearerAuth accepts it.
+  // The static MCP_BEARER_TOKEN — the documented curl/testing path — authenticates
+  // /mcp and can drive a session. (Was previously 401 "Token has no expiration time".)
+  it("static MCP_BEARER_TOKEN is now accepted at /mcp and can list tools", async () => {
+    const staticToken = config.security.mcpBearerToken as string;
+    expect(staticToken, "test env must set MCP_BEARER_TOKEN").toBeTruthy();
+
+    const init = await request(app)
       .post("/mcp")
-      .set("Authorization", `Bearer ${config.security.mcpBearerToken}`)
+      .set("Authorization", `Bearer ${staticToken}`)
       .set("Accept", accept)
       .set("Content-Type", "application/json")
       .send({
@@ -334,6 +409,60 @@ describe("MCP transport — auth & session negatives", () => {
           clientInfo: { name: "supertest", version: "1.0.0" },
         },
       });
-    expect(res.status).toBe(401);
+    expect(init.status).toBe(200);
+    const sessionId = init.headers["mcp-session-id"];
+    expect(sessionId, "static bearer should establish an /mcp session").toBeTruthy();
+
+    // initialized notification
+    await request(app)
+      .post("/mcp")
+      .set("Authorization", `Bearer ${staticToken}`)
+      .set("Accept", accept)
+      .set("Content-Type", "application/json")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    // tools/list over the established session
+    const list = await request(app)
+      .post("/mcp")
+      .set("Authorization", `Bearer ${staticToken}`)
+      .set("Accept", accept)
+      .set("Content-Type", "application/json")
+      .set("mcp-session-id", sessionId)
+      .send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    expect(list.status).toBe(200);
+    const msg = parseSse(list.text).find((m) => m.id === 2) as
+      | { result?: { tools?: unknown[] } }
+      | undefined;
+    expect(msg?.result?.tools).toHaveLength(7);
+  });
+});
+
+// Kept last: the per-IP failed-attempt counter is process-wide, so locking out the
+// (shared) test IP here must not precede other password tests in this file.
+describe("Password rate limiting on password endpoints", () => {
+  it("locks out an IP after 5 failed password attempts (429 + Retry-After)", async () => {
+    // 5 wrong passwords are allowed (each rejected with 401)…
+    for (let i = 0; i < 5; i++) {
+      const r = await request(app)
+        .post("/auth/whoop")
+        .type("form")
+        .send({ password: "definitely-wrong-guess" });
+      expect(r.status, `attempt ${i + 1} should be 401`).toBe(401);
+    }
+    // …the 6th from the same IP is rate-limited.
+    const blocked = await request(app)
+      .post("/auth/whoop")
+      .type("form")
+      .send({ password: "definitely-wrong-guess" });
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBeTruthy();
+
+    // A correct password is also blocked while the lockout window is active.
+    const correctButLocked = await request(app)
+      .post("/auth/whoop")
+      .type("form")
+      .send({ password: PASSWORD });
+    expect(correctButLocked.status).toBe(429);
   });
 });

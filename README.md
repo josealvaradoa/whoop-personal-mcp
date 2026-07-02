@@ -153,7 +153,8 @@ This is a **single-tenant** server: one WHOOP account per deployment, stored in 
 - **Consent gate.** Connecting a new MCP client, or linking a WHOOP account, requires entering `ACCESS_PASSWORD` in the browser. An earlier version auto-approved any client that reached the server URL; the consent gate closes that hole (see [SECURITY.md](SECURITY.md)).
 - **Encryption at rest.** WHOOP access/refresh tokens are encrypted with AES-256-GCM using a PBKDF2-derived key (random salt + IV per encryption).
 - **Hashed MCP tokens.** MCP access/refresh tokens are stored as SHA-256 hashes, so a database leak yields no usable credentials.
-- **Timing-safe comparisons**, **HTTPS-only redirect registration** (localhost excepted), and a **CORS allowlist** (`claude.ai`, `claude.com`, localhost, plus anything in `CORS_ORIGINS`).
+- **Redirect-host allowlist.** Dynamic client registration only accepts `redirect_uri`s that are https on an allow-listed host (`claude.ai`/`claude.com` by default, or `ALLOWED_REDIRECT_HOSTS`), matched exactly — so an attacker cannot register a "Claude"-named client that points authorization codes at their own domain. The consent page also shows the concrete destination host.
+- **Timing-safe comparisons**, a **per-IP password rate limit** on the browser password endpoints, and a **CORS allowlist** (`claude.ai`, `claude.com`, localhost, plus anything in `CORS_ORIGINS`).
 
 This project went through a full security audit; [SECURITY.md](SECURITY.md) documents the threat model and the specific attack the consent gate closes.
 
@@ -168,11 +169,12 @@ This project went through a full security audit; [SECURITY.md](SECURITY.md) docu
 | `WHOOP_REDIRECT_URI` | Yes | WHOOP OAuth callback. Local: `http://localhost:3000/auth/whoop/callback`. Prod: `https://<your-app>.railway.app/auth/whoop/callback` — must match the URI registered in your WHOOP app |
 | `ENCRYPTION_SECRET` | Yes | 32+ char secret; derives the AES-256-GCM key (PBKDF2) used to encrypt WHOOP tokens at rest |
 | `ACCESS_PASSWORD` | Yes | 12+ char password entered in the browser to authorize a client or link WHOOP (the consent gate) |
-| `MCP_BEARER_TOKEN` | No | Static bearer token for direct MCP access via curl/scripts. When unset, only the OAuth flow can authenticate |
+| `MCP_BEARER_TOKEN` | No | Static bearer token for direct MCP access via curl/scripts, sent as `Authorization: Bearer <token>` to `/mcp`. When unset, only the OAuth flow can authenticate |
 | `PORT` | No | HTTP port (default `3000`) |
 | `NODE_ENV` | No | `development` or `production` (default `development`) |
 | `PUBLIC_URL` | No | Public base URL used as the OAuth issuer. Set to your Railway URL in production (default `http://localhost:<PORT>`) |
 | `CORS_ORIGINS` | No | Comma-separated extra CORS origins, additive to the built-in allowlist (`claude.ai`, `claude.com`, and any localhost) |
+| `ALLOWED_REDIRECT_HOSTS` | No | Comma-separated hostnames whose **https** `redirect_uri`s may be registered by MCP clients. When set it **replaces** the built-in defaults (`claude.ai`, `claude.com`, `www.claude.ai`, `www.claude.com`); `localhost`/`127.0.0.1` are always allowed |
 | `DATA_DIR` | No | Directory for the SQLite database (default `./data`) |
 
 ### Training Config (`whoop-mcp.config.json`)

@@ -23,6 +23,11 @@ export interface Config {
     mcpBearerToken: string | undefined;
     // Browser password gating client authorization and WHOOP account linking.
     accessPassword: string;
+    // Hostnames whose https redirect_uris may be registered by MCP clients
+    // (consent-gate phishing mitigation). Remote defaults are the Claude hosts;
+    // ALLOWED_REDIRECT_HOSTS replaces them when set. localhost/127.0.0.1 are
+    // always allowed separately (http included) and are not listed here.
+    allowedRedirectHosts: string[];
   };
   server: {
     port: number;
@@ -54,6 +59,22 @@ export interface Config {
     ttl_minutes: number;
     history_window_days: number;
   };
+}
+
+// Remote redirect hosts allowed for dynamic client registration when
+// ALLOWED_REDIRECT_HOSTS is unset. localhost/127.0.0.1 are always allowed
+// separately (see isAllowedRedirectUri in server.ts) and are not listed here.
+const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com", "www.claude.ai", "www.claude.com"];
+
+// ALLOWED_REDIRECT_HOSTS (comma-separated hostnames), when set, REPLACES the
+// remote defaults entirely (localhost stays allowed regardless).
+function resolveAllowedRedirectHosts(): string[] {
+  const raw = process.env.ALLOWED_REDIRECT_HOSTS;
+  if (!raw) return [...DEFAULT_REDIRECT_HOSTS];
+  return raw
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 function requireEnv(name: string): string {
@@ -138,6 +159,7 @@ function buildConfig(): Config {
       encryptionSecret,
       mcpBearerToken: process.env.MCP_BEARER_TOKEN || undefined,
       accessPassword,
+      allowedRedirectHosts: resolveAllowedRedirectHosts(),
     },
     server: {
       port: parseInt(process.env.PORT ?? "3000", 10),

@@ -63,6 +63,55 @@ function secretsMatch(a: string, b: string): boolean {
   );
 }
 
+// --- Password-endpoint rate limiting (dependency-free, in-memory, per-IP) ---
+// Throttles brute-force password guessing on POST /auth/consent and /auth/whoop.
+// After MAX_PW_ATTEMPTS failures from one IP within PW_WINDOW_MS the IP is locked
+// out (429 + Retry-After) until the window elapses; a correct password resets it.
+const PW_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_PW_ATTEMPTS = 5;
+const pwAttempts = new Map<string, { count: number; first: number }>();
+
+// Seconds to wait if the IP is currently locked out, else 0 (also expires stale windows).
+function pwLockoutRetryAfter(ip: string): number {
+  const rec = pwAttempts.get(ip);
+  if (!rec) return 0;
+  if (Date.now() - rec.first > PW_WINDOW_MS) {
+    pwAttempts.delete(ip);
+    return 0;
+  }
+  if (rec.count >= MAX_PW_ATTEMPTS) {
+    return Math.ceil((PW_WINDOW_MS - (Date.now() - rec.first)) / 1000);
+  }
+  return 0;
+}
+
+function recordPwFailure(ip: string): void {
+  const now = Date.now();
+  const rec = pwAttempts.get(ip);
+  if (!rec || now - rec.first > PW_WINDOW_MS) {
+    pwAttempts.set(ip, { count: 1, first: now });
+  } else {
+    rec.count += 1;
+  }
+}
+
+function resetPwAttempts(ip: string): void {
+  pwAttempts.delete(ip);
+}
+
+// Returns true and sends a 429 (with Retry-After) if the IP is locked out.
+function rejectIfRateLimited(req: Request, res: Response): boolean {
+  const ip = req.ip ?? "unknown";
+  const retryAfter = pwLockoutRetryAfter(ip);
+  if (retryAfter > 0) {
+    console.error(`[auth] password attempt RATE-LIMITED for ip (retry in ${retryAfter}s)`);
+    res.setHeader("Retry-After", String(retryAfter));
+    res.status(429).send("Too many password attempts. Please try again later.");
+    return true;
+  }
+  return false;
+}
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -72,7 +121,11 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-// Only allow redirect URIs that are https, or http on localhost/127.0.0.1.
+// Redirect-URI allowlist (consent-gate phishing mitigation). A remote redirect
+// target must be https AND have a hostname that EXACTLY equals an allowed host
+// (config.security.allowedRedirectHosts) — no suffix/substring matching, so
+// claude.ai.evil.com and sub.claude.ai.evil.com are rejected. localhost and
+// 127.0.0.1 stay allowed (http included) for local dev / curl.
 function isAllowedRedirectUri(uri: string): boolean {
   let parsed: URL;
   try {
@@ -80,11 +133,14 @@ function isAllowedRedirectUri(uri: string): boolean {
   } catch {
     return false;
   }
-  if (parsed.protocol === "https:") return true;
-  return (
-    parsed.protocol === "http:" &&
-    (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1")
-  );
+  const host = parsed.hostname.toLowerCase();
+  if (
+    (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+    (host === "localhost" || host === "127.0.0.1")
+  ) {
+    return true;
+  }
+  return parsed.protocol === "https:" && config.security.allowedRedirectHosts.includes(host);
 }
 
 // --- MCP OAuth: short-lived state in-memory, persistent state in SQLite ---
@@ -105,10 +161,23 @@ function dbGetClient(clientId: string): OAuthClientInformationFull | undefined {
   return JSON.parse(row.client_info) as OAuthClientInformationFull;
 }
 
+// Registration stays open (Claude self-registers), so bound storage: keep at most
+// MAX_MCP_CLIENTS rows, evicting the oldest by created_at (rowid breaks same-second ties).
+const MAX_MCP_CLIENTS = 100;
+
 function dbRegisterClient(clientInfo: OAuthClientInformationFull): void {
   const db = getDb();
   db.prepare("INSERT OR REPLACE INTO mcp_clients (client_id, client_info) VALUES (?, ?)")
     .run(clientInfo.client_id, JSON.stringify(clientInfo));
+  const { count } = db.prepare("SELECT COUNT(*) AS count FROM mcp_clients").get() as { count: number };
+  if (count > MAX_MCP_CLIENTS) {
+    db.prepare(
+      `DELETE FROM mcp_clients WHERE client_id IN (
+         SELECT client_id FROM mcp_clients ORDER BY created_at ASC, rowid ASC LIMIT ?
+       )`
+    ).run(count - MAX_MCP_CLIENTS);
+    console.log(`[auth] mcp_clients capped at ${MAX_MCP_CLIENTS} — evicted ${count - MAX_MCP_CLIENTS} oldest`);
+  }
 }
 
 // MCP tokens are stored hashed (sha256). Incoming tokens are hashed before lookup;
@@ -166,11 +235,12 @@ const clientsStore: OAuthRegisteredClientsStore = {
     return client;
   },
   registerClient(clientInfo: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">) {
-    // Defense in depth: only issue codes to https (or localhost) redirect targets.
+    // Anti-phishing: only register redirect targets on the allowed-host list
+    // (https + exact hostname match; localhost also allowed over http).
     for (const uri of clientInfo.redirect_uris) {
       if (!isAllowedRedirectUri(uri)) {
         console.error(`[auth] registerClient REJECTED — disallowed redirect_uri`);
-        throw new Error("redirect_uris must use https (http allowed only for localhost)");
+        throw new Error("redirect_uris must be https on an allowed host (http allowed only for localhost)");
       }
     }
     const clientId = randomBytes(16).toString("hex");
@@ -210,7 +280,7 @@ export const oauthProvider: OAuthServerProvider = {
       createdAt: Date.now(),
     });
     console.log(`[auth] consent gate → rendering form for consentId ${consentId.slice(0, 8)}…`);
-    sendConsentPage(res, consentId, client.client_name);
+    sendConsentPage(res, consentId, client.client_name, params.redirectUri);
   },
 
   async challengeForAuthorizationCode(
@@ -220,6 +290,12 @@ export const oauthProvider: OAuthServerProvider = {
     const data = authorizationCodes.get(authorizationCode);
     console.log(`[auth] challengeForAuthorizationCode → ${data ? "found" : "NOT FOUND"} (stored codes: ${authorizationCodes.size})`);
     if (!data) throw new Error("Invalid authorization code");
+    // Enforce the code TTL at use, not just at the 10-min sweep.
+    if (Date.now() - data.createdAt > AUTH_CODE_TTL_MS) {
+      authorizationCodes.delete(authorizationCode);
+      console.error(`[auth] challengeForAuthorizationCode FAILED — code expired`);
+      throw new Error("Invalid authorization code");
+    }
     return data.codeChallenge;
   },
 
@@ -234,9 +310,16 @@ export const oauthProvider: OAuthServerProvider = {
       console.error(`[auth] exchangeAuthorizationCode FAILED — code ${data ? "found but clientId mismatch" : "NOT FOUND"}`);
       throw new Error("Invalid authorization code");
     }
-    // Bind the redirect_uri to the one the code was issued for (when supplied).
-    if (redirectUri !== undefined && redirectUri !== data.redirectUri) {
-      console.error(`[auth] exchangeAuthorizationCode FAILED — redirect_uri mismatch`);
+    // Enforce the code TTL at use, not just at the 10-min sweep.
+    if (Date.now() - data.createdAt > AUTH_CODE_TTL_MS) {
+      authorizationCodes.delete(authorizationCode);
+      console.error(`[auth] exchangeAuthorizationCode FAILED — code expired`);
+      throw new Error("Invalid authorization code");
+    }
+    // Bind the redirect_uri: it is always recorded at issue, so require the
+    // incoming value to be present AND exactly equal (mandatory, not optional).
+    if (redirectUri === undefined || redirectUri !== data.redirectUri) {
+      console.error(`[auth] exchangeAuthorizationCode FAILED — redirect_uri missing or mismatch`);
       throw new Error("Invalid authorization code");
     }
     console.log(`[auth] exchangeAuthorizationCode → success, issuing access + refresh tokens`);
@@ -308,6 +391,9 @@ export const oauthProvider: OAuthServerProvider = {
         token,
         clientId: "static",
         scopes: [],
+        // Recomputed each request, so the static token never really expires; this
+        // satisfies the SDK's requireBearerAuth, which 401s tokens with no expiry.
+        expiresAt: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL_S,
       };
     }
 
@@ -423,12 +509,28 @@ function sendPasswordPage(
 }
 
 // Renders the client-consent gate form (POSTs to /auth/consent with a single-use consentId).
-function sendConsentPage(res: Response, consentId: string, clientName?: string, error?: string): void {
+// Also surfaces the concrete redirect_uri host so the owner sees where data will go
+// (anti-phishing transparency); the host is escaped by sendPasswordPage.
+function sendConsentPage(
+  res: Response,
+  consentId: string,
+  clientName?: string,
+  redirectUri?: string,
+  error?: string
+): void {
   const who = clientName ? `"${clientName}"` : "An application";
+  let destination = "";
+  if (redirectUri) {
+    try {
+      destination = ` This will send your data to: ${new URL(redirectUri).host}.`;
+    } catch {
+      destination = "";
+    }
+  }
   sendPasswordPage(res, {
     action: "/auth/consent",
     title: "Authorize access",
-    description: `${who} wants to connect to your WHOOP data. Enter your access password to approve.`,
+    description: `${who} wants to connect to your WHOOP data.${destination} Enter your access password to approve.`,
     hidden: { consentId },
     error,
   });
@@ -522,6 +624,7 @@ export function createApp(): express.Express {
 
   // Consent gate — validate ACCESS_PASSWORD, then complete the pending MCP authorization.
   app.post("/auth/consent", (req: Request, res: Response) => {
+    if (rejectIfRateLimited(req, res)) return;
     const body = req.body as { consentId?: unknown; password?: unknown };
     const consentId = typeof body.consentId === "string" ? body.consentId : "";
     const password = typeof body.password === "string" ? body.password : "";
@@ -537,15 +640,17 @@ export function createApp(): express.Express {
     }
 
     if (!secretsMatch(password, config.security.accessPassword)) {
+      recordPwFailure(req.ip ?? "unknown");
       // Re-arm a fresh single-use consentId carrying the same pending params.
       cleanupStates();
       const freshId = randomBytes(16).toString("hex");
       pendingConsent.set(freshId, { ...pending, createdAt: Date.now() });
       console.error(`[auth] /auth/consent REJECTED — wrong password (re-armed ${freshId.slice(0, 8)}…)`);
-      sendConsentPage(res, freshId, pending.clientName, "Incorrect password. Please try again.");
+      sendConsentPage(res, freshId, pending.clientName, pending.redirectUri, "Incorrect password. Please try again.");
       return;
     }
 
+    resetPwAttempts(req.ip ?? "unknown");
     console.log(`[auth] /auth/consent OK — client ${pending.clientId.slice(0, 8)}… approved`);
 
     // If WHOOP tokens already exist, issue the MCP authorization code now.
@@ -588,13 +693,16 @@ export function createApp(): express.Express {
   });
 
   app.post("/auth/whoop", (req: Request, res: Response) => {
+    if (rejectIfRateLimited(req, res)) return;
     const body = req.body as { password?: unknown };
     const password = typeof body.password === "string" ? body.password : "";
     if (!secretsMatch(password, config.security.accessPassword)) {
+      recordPwFailure(req.ip ?? "unknown");
       console.error(`[auth] POST /auth/whoop REJECTED — wrong password`);
       sendPasswordPage(res, { ...WHOOP_LINK_FORM, error: "Incorrect password. Please try again." });
       return;
     }
+    resetPwAttempts(req.ip ?? "unknown");
     cleanupStates();
     const state = randomBytes(16).toString("hex");
     pendingStates.set(state, Date.now());
