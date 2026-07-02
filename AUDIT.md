@@ -185,3 +185,64 @@ The strongest parts of this project for interviews are things you may not be pre
 ---
 
 *Build verification: `pnpm install --frozen-lockfile`, `pnpm run typecheck`, `pnpm run lint`, `pnpm run build` all pass on Node 22. In-memory MCP smoke test: 7/7 tools listed with correct schemas + annotations; invalid-argument calls rejected by zod validation as expected.*
+
+---
+
+# Remediation status — 2026-07-02
+
+The audit above was acted on the same day in three phases, with an adversarial review panel between the fixes and the finish. Every finding below is either fixed-and-verified or consciously deferred with a reason. Final gate on the integrated branch: **`typecheck` + `lint` + `build` clean, 147 tests passing, production server boots and serves the 7-tool MCP surface** (static bearer authenticates at `/mcp`, unauth → 401, tool calls degrade to a graceful `isError` with no WHOOP tokens).
+
+## How it was done
+
+Work ran as parallel, file-disjoint changes, each verified before commit:
+
+1. **Phase 1 — remediate the audit.** Security hardening, correctness + MCP structured output, toolchain modernization.
+2. **Phase 2 — prove and document it.** A 102-test suite (compute units, MCP contract, OAuth flow) and a documentation rewrite.
+3. **Review panel.** Three independent adversarial reviewers (security, compute-correctness, MCP-integration) tried to break the full diff. They cleared the highest-risk item (null-branch structured output validates for all 7 tools) and surfaced ~20 further findings — including three HIGH analytics bugs the first pass introduced or left.
+4. **Phase 3 — fix what the panel found.** Three more disjoint fix passes; the suite grew to 147 tests.
+
+## Original audit findings → status
+
+| Finding | Status | Where |
+|---|---|---|
+| §1.1 CRITICAL — any client auto-approved | **Fixed** — `ACCESS_PASSWORD` consent gate; no code issued without it | `4e67226`, hardened `82f7f10` |
+| §1.2 HIGH — `/auth/whoop` unauthenticated | **Fixed** — same consent gate on account linking | `4e67226` |
+| §1.3 MED — MCP tokens stored plaintext | **Fixed** — SHA-256 hashed at rest | `4e67226` |
+| §1.4 MED — non-timing-safe compares | **Fixed** — `timingSafeEqual` over digests everywhere | `4e67226` |
+| §1.5 LOW — error leakage / static token / CORS / redirect binding | **Fixed** — generic errors, CORS allowlist, redirect binding; static bearer made optional **and actually functional** (it never worked — see review) | `4e67226`, `82f7f10` |
+| §2.1 — missing data reported as zero | **Fixed** — explicit `null` + `data_available`/date fields; "null ≠ zero" is now the contract | `60c1bfe` |
+| §2.2 — unscored records throw | **Fixed** — `score_state` filtering everywhere | `60c1bfe` |
+| §2.3 — naps counted as nights | **Fixed** — `nap` filtered from nightly aggregation | `60c1bfe` |
+| §2.4 — window math by record, not calendar day | **Fixed** — explicit sort + calendar-day bucketing; in-progress cycles excluded | `60c1bfe` |
+| §2.5 — fitness-trend dead branch, naming, pagination, bounds | **Fixed** — overreaching branch, `last_night_vs_target_hrs`, `limit=25`, `.max(365)` | `60c1bfe` |
+| §3 — dead config, duplication, config validation, shutdown, Node 20, two lockfiles, root container | **Mostly fixed** — dead `MCP_OAUTH_*` removed, `stats.ts`/`defineTool` dedupe, Node 22, single lockfile, non-root container. **Deferred:** zod-based config schema and graceful-shutdown handler (noted below) | `8018306`, `60c1bfe` |
+| §4 — no tests | **Fixed** — 147 tests + CI | `bdf2766`, `5493cdf` |
+| §5 — documentation drift | **Fixed** — tool names, env table, transport wording, security section, real URLs | `ff828cd`, `82f7f10` |
+
+## Review-panel findings → status
+
+Security (all fixed in `82f7f10`): consent-gate **phishing** (registration now allowlists redirect hosts — default Claude + localhost, `ALLOWED_REDIRECT_HOSTS` to extend — and the consent page shows the data destination); auth-code TTL enforced at exchange; per-IP password rate limiting; bounded client registration; mandatory redirect-uri binding.
+
+Client/transport (all fixed in `53652fe`): **401 now forces a real token refresh** instead of retrying the same token; malformed WHOOP responses are guarded; **session eviction never tears down an in-flight request** (in-flight counting, delete-before-close, 503 when all busy); body-read timeout; `DELETE /mcp` and orphaned-transport cleanup. The previously-untested pagination path is now covered.
+
+Compute correctness (all fixed in `5493cdf`) — the three HIGHs would each have produced wrong coaching advice:
+- **Monotony** null below 4/7 days (was exploding to ~30 on a light week → false "too repetitive").
+- **Consecutive-day streaks** now require calendar adjacency (gapped red readings no longer trip false "critical fatigue").
+- **ACWR** null without an adequate chronic base (was reporting a reassuring "optimal" on a week of data).
+- Plus: `as_of_date`/`days_since_last_data` on trend tools (stale sync no longer reads as current); raw strain array agrees with computed; SCORED filter on race volume; per-record resilience so one dirty record can't fail a tool; boundary recoveries no longer dropped; `roundTo(null)→null`; sleep dated by wake day; generic tool errors.
+
+## Consciously deferred (not blockers, documented for honesty)
+
+- **zod config schema / graceful SIGTERM shutdown** (§3) — real improvements, not correctness or security risks; left for a follow-up so this pass stayed scoped to audit + review findings.
+- **Timezone handling** — all date bucketing is UTC by design; documented as a known limitation rather than adding per-athlete timezone config.
+- **Acute-load inflation under partial device wear** (review MED #5) — mitigated by the completeness gates and the surfaced `days_with_data` counts rather than by zero-filling rest days, which would trade one bias for another. Documented, not silently "fixed."
+
+## Going-public checklist (updated)
+
+- [x] Critical/high security holes closed and independently re-reviewed
+- [x] Test suite + CI (147 tests: compute, contract, OAuth, client, session)
+- [x] Docs match the code; `SECURITY.md` with threat model
+- [x] Node 22, single lockfile, non-root container
+- [x] Secret scan clean across all history
+- [ ] Owner-supplied assets: demo screenshot/GIF, and a Railway template link if desired (placeholders left in README)
+- [ ] Optional next: eval harness (fixture week → assert recommendation direction), MCP resource/prompt surface, zod config schema, graceful shutdown
