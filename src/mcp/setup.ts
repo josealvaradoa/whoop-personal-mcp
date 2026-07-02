@@ -20,6 +20,10 @@ interface Session {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   lastActivity: number;
+  // Number of requests currently being served by this session. A session is never
+  // evicted (LRU) or swept (idle timeout) while a request is in flight, so a
+  // long-running WHOOP call cannot have its transport torn down mid-request.
+  inFlight: number;
 }
 
 function createMcpServer(): McpServer {
@@ -50,11 +54,12 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
   const auth = requireBearerAuth({ verifier: provider });
   const sessions = new Map<string, Session>();
 
-  // Evict expired sessions every 5 minutes
+  // Evict expired sessions every 5 minutes. Skip sessions with an in-flight
+  // request so a slow WHOOP call is never torn down out from under itself.
   setInterval(() => {
     const now = Date.now();
     for (const [id, session] of sessions) {
-      if (now - session.lastActivity > SESSION_TIMEOUT_MS) {
+      if (session.inFlight === 0 && now - session.lastActivity > SESSION_TIMEOUT_MS) {
         console.log(`Session ${id} timed out, closing`);
         session.transport.close();
         session.server.close();
@@ -63,22 +68,28 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
     }
   }, CLEANUP_INTERVAL_MS);
 
-  async function evictOldest(): Promise<void> {
+  // Evict the least-recently-active *idle* session. Returns true if one was
+  // evicted, false if every session is currently in flight (caller should then
+  // refuse the new session rather than tear down a busy one). The entry is
+  // removed from the map before awaiting close() so a concurrent request can
+  // never route to a session that is mid-teardown.
+  async function evictOldest(): Promise<boolean> {
     let oldestId: string | null = null;
     let oldestTime = Infinity;
     for (const [id, session] of sessions) {
+      if (session.inFlight > 0) continue; // never evict a session with a live request
       if (session.lastActivity < oldestTime) {
         oldestTime = session.lastActivity;
         oldestId = id;
       }
     }
-    if (oldestId) {
-      const old = sessions.get(oldestId)!;
-      console.log(`Evicting oldest session ${oldestId}`);
-      await old.transport.close();
-      await old.server.close();
-      sessions.delete(oldestId);
-    }
+    if (!oldestId) return false; // all sessions busy
+    const old = sessions.get(oldestId)!;
+    console.log(`Evicting oldest session ${oldestId}`);
+    sessions.delete(oldestId);
+    await old.transport.close();
+    await old.server.close();
+    return true;
   }
 
   // POST /mcp — JSON-RPC requests
@@ -92,7 +103,15 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
     if (sessionId && sessions.has(sessionId)) {
       const session = sessions.get(sessionId)!;
       session.lastActivity = Date.now();
-      await session.transport.handleRequest(req, res, req.body);
+      // Mark in-flight for the whole request so eviction/sweep skip this session,
+      // and refresh lastActivity on completion so a long call isn't "oldest".
+      session.inFlight++;
+      try {
+        await session.transport.handleRequest(req, res, req.body);
+      } finally {
+        session.inFlight--;
+        session.lastActivity = Date.now();
+      }
       return;
     }
 
@@ -120,9 +139,22 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
       return;
     }
 
-    // Enforce session cap with LRU eviction
+    // Enforce session cap with LRU eviction. If every existing session is busy
+    // serving a request, refuse the new one (503) rather than evict a live one.
     if (sessions.size >= MAX_SESSIONS) {
-      await evictOldest();
+      const evicted = await evictOldest();
+      if (!evicted) {
+        console.error(`[mcp] REJECTED initialize — all ${MAX_SESSIONS} sessions are busy`);
+        res.status(503).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Server busy: maximum concurrent sessions reached. Please retry shortly.",
+          },
+          id: (req.body as { id?: string | number | null })?.id ?? null,
+        });
+        return;
+      }
     }
 
     // Create new session
@@ -147,8 +179,15 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
         transport,
         server: mcpServer,
         lastActivity: Date.now(),
+        inFlight: 0,
       });
       console.log(`New MCP session: ${transport.sessionId} (active: ${sessions.size})`);
+    } else {
+      // initialize returned without assigning a session id → nothing tracks this
+      // connected transport/server pair, so close both to avoid leaking them.
+      console.error(`[mcp] initialize did not assign a session id — closing orphaned transport/server`);
+      await transport.close();
+      await mcpServer.close();
     }
     } catch (err) {
       // Log the detail server-side; return only a generic message to the client.
@@ -181,16 +220,24 @@ export function mountMcp(app: Express, provider: OAuthServerProvider): void {
 
   // DELETE /mcp — close a session
   app.delete("/mcp", auth, async (req: Request, res: Response) => {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !sessions.has(sessionId)) {
-      res.status(404).json({ error: "Session not found" });
-      return;
+    try {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      const session = sessions.get(sessionId)!;
+      sessions.delete(sessionId); // drop from the map before awaiting close()
+      await session.transport.close();
+      await session.server.close();
+      console.log(`Session ${sessionId} closed (active: ${sessions.size})`);
+      res.status(200).json({ status: "session closed" });
+    } catch (err) {
+      // Log the detail server-side; return only a generic message to the client.
+      console.error("DELETE /mcp error:", err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Internal server error" });
+      }
     }
-    const session = sessions.get(sessionId)!;
-    await session.transport.close();
-    await session.server.close();
-    sessions.delete(sessionId);
-    console.log(`Session ${sessionId} closed (active: ${sessions.size})`);
-    res.status(200).json({ status: "session closed" });
   });
 }

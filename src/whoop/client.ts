@@ -1,4 +1,4 @@
-import { getValidAccessToken, invalidateTokenCache } from "./auth.js";
+import { getValidAccessToken, forceRefreshAccessToken } from "./auth.js";
 import { config } from "../config.js";
 import * as cache from "../db/cache.js";
 import type {
@@ -31,34 +31,48 @@ async function fetchWhoop<T>(
   }
 
   console.log(`[whoop-api] ${endpoint} ${params ? JSON.stringify(params) : ""}`);
+  // The abort/timeout covers BOTH the header fetch and the body read: clearTimeout
+  // only fires in the finally (after the body is consumed or throws), so a stalled
+  // response body cannot hang a tool call indefinitely.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  let response: globalThis.Response;
   try {
-    response = await fetch(url.toString(), {
+    const response = await fetch(url.toString(), {
       headers: { Authorization: `Bearer ${accessToken}` },
       signal: controller.signal,
     });
+
+    if (!response.ok) {
+      const body = await response.text();
+
+      // On 401, FORCE a token refresh and retry once. A plain cache-invalidate is
+      // not enough: getValidAccessToken() reloads the same still-"valid" DB token
+      // whenever it is outside the 300s expiry buffer, so a WHOOP-side early
+      // revocation would never heal. forceRefreshAccessToken() bypasses that
+      // shortcut (and coalesces concurrent 401s via the single-flight mutex).
+      if (response.status === 401 && !isRetry) {
+        console.warn(`[whoop-api] ${endpoint} → 401, forcing token refresh and retrying…`);
+        clearTimeout(timeoutId); // this request is done; refresh + retry own their timeouts
+        await forceRefreshAccessToken(); // surfaces a clear re-authorize error on definitive failure
+        return await fetchWhoop<T>(endpoint, params, true);
+      }
+
+      console.error(`[whoop-api] ${endpoint} → ${response.status}: ${body.slice(0, 200)}`);
+      throw new Error(`Whoop API error ${response.status} on ${endpoint}: ${body}`);
+    }
+
+    console.log(`[whoop-api] ${endpoint} → ${response.status}`);
+    try {
+      return (await response.json()) as T;
+    } catch (parseErr) {
+      // 200 with an empty / non-JSON body (or a body read aborted by the timeout).
+      // Log the detail server-side; surface a generic internal error to the caller.
+      console.error(`[whoop-api] ${endpoint} → 200 but body was unreadable:`, parseErr);
+      throw new Error(`Whoop API returned an unreadable response on ${endpoint}`);
+    }
   } finally {
     clearTimeout(timeoutId);
   }
-
-  if (!response.ok) {
-    const body = await response.text();
-
-    // On 401, invalidate cached token and retry once with a fresh token
-    if (response.status === 401 && !isRetry) {
-      console.warn(`[whoop-api] ${endpoint} → 401, refreshing token and retrying…`);
-      invalidateTokenCache();
-      return fetchWhoop<T>(endpoint, params, true);
-    }
-
-    console.error(`[whoop-api] ${endpoint} → ${response.status}: ${body.slice(0, 200)}`);
-    throw new Error(`Whoop API error ${response.status} on ${endpoint}: ${body}`);
-  }
-
-  console.log(`[whoop-api] ${endpoint} → ${response.status}`);
-  return (await response.json()) as T;
 }
 
 const MAX_PAGES = 50;
@@ -74,6 +88,15 @@ async function fetchAllPages<T>(
 
   for (let page_num = 0; page_num < MAX_PAGES; page_num++) {
     const page = await fetchWhoop<PaginatedResponse<T>>(endpoint, queryParams);
+
+    // Guard a malformed 200 body: the WHOOP contract guarantees `records` is an
+    // array. If it is not, log the shape server-side and surface a generic upstream
+    // error rather than crashing with "records is not iterable" (never leak the body).
+    if (!page || !Array.isArray(page.records)) {
+      console.error(`[whoop-api] ${endpoint} → 200 but 'records' was not an array (got ${typeof page?.records})`);
+      throw new Error(`Whoop API returned an unexpected response shape on ${endpoint}`);
+    }
+
     allRecords.push(...page.records);
 
     if (!page.next_token || page.records.length === 0) break;
