@@ -1,119 +1,154 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { daysAgo, today, getWorkoutCollection } from "../../whoop/client.js";
+import { kjToKcal } from "../../compute/stats.js";
+import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
 
 const MILLI_TO_MIN = 1 / (1000 * 60);
 
 export function registerWorkoutsTool(server: McpServer): void {
-  server.registerTool(
+  defineTool(
+    server,
     "whoop_get_workouts",
     {
       title: "Workout History",
-      description: "Get workout history with sport type, strain, duration, heart rate data, and HR zone distribution. Includes weekly volume and intensity analysis.",
+      description:
+        "Get workout history with sport type, strain, duration, heart rate data, and HR zone distribution. Includes weekly volume and intensity analysis. Only WHOOP-scored workouts are included; counts and totals are zero only when no matching workouts were logged (they are never fabricated from missing data). avg_hr/max_hr are null when WHOOP did not record them. A single dirty record (e.g. a bad timestamp) is dropped rather than failing the whole request.",
       inputSchema: {
-        days: z.number().int().min(1).optional().default(14).describe("Number of days to look back. Minimum 1, default 14."),
+        days: z.number().int().min(1).max(365).optional().default(14).describe("Number of days to look back. Minimum 1, maximum 365, default 14."),
         sport: z.string().optional().describe("Filter by sport name (e.g. 'running', 'cycling', 'swimming'). Optional."),
       },
-      annotations: {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: true,
+      outputSchema: {
+        raw: z.object({
+          workouts: z.array(
+            z.object({
+              date: z.string(),
+              sport: z.string(),
+              strain: z.number(),
+              duration_min: z.number(),
+              avg_hr: z.number().nullable(),
+              max_hr: z.number().nullable(),
+              calories: z.number(),
+              hr_zones_minutes: z.object({
+                zone1: z.number(),
+                zone2: z.number(),
+                zone3: z.number(),
+                zone4: z.number(),
+                zone5: z.number(),
+              }),
+            }),
+          ),
+        }),
+        computed: z.object({
+          total_workouts: z.number(),
+          weekly_volume_hrs: z.number(),
+          weekly_strain_total: z.number(),
+          sport_distribution: z.record(z.string(), z.number()),
+          intensity_distribution: z.object({
+            zone1_2_pct: z.number(),
+            zone3_pct: z.number(),
+            zone4_5_pct: z.number(),
+          }),
+        }),
       },
+      annotations: READ_ONLY_ANNOTATIONS,
+      errorLabel: "fetching workouts",
     },
     async ({ days, sport }) => {
-      try {
-        const workouts = await getWorkoutCollection(daysAgo(days), today());
+      const workouts = await getWorkoutCollection(daysAgo(days), today());
 
-        // Map to readable format — filter out unscored workouts
-        const mapped = workouts
-          .filter((w) => w.score_state === "SCORED" && w.score)
-          .map((w) => {
-            const zd = w.score.zone_durations;
-            const durationMin = Math.round(
-              (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60)
-            );
-            return {
-              date: w.start.split("T")[0],
-              sport: w.sport_name,
-              strain: w.score.strain,
-              duration_min: durationMin,
-              avg_hr: w.score.average_heart_rate,
-              max_hr: w.score.max_heart_rate,
-              calories: Math.round(w.score.kilojoule * 0.239006),
-              hr_zones_minutes: {
-                zone1: Math.round(zd.zone_one_milli * MILLI_TO_MIN),
-                zone2: Math.round(zd.zone_two_milli * MILLI_TO_MIN),
-                zone3: Math.round(zd.zone_three_milli * MILLI_TO_MIN),
-                zone4: Math.round(zd.zone_four_milli * MILLI_TO_MIN),
-                zone5: Math.round(zd.zone_five_milli * MILLI_TO_MIN),
-              },
-            };
-          });
+      const isFiniteNum = (n: unknown): n is number =>
+        typeof n === "number" && Number.isFinite(n);
+      const nullIfNotFinite = (n: unknown): number | null => (isFiniteNum(n) ? n : null);
+      // A missing zone breakdown is genuinely 0 minutes in that zone, not a fabricated
+      // metric — coerce non-finite millis to 0 so one dirty field can't NaN the record.
+      const zoneMin = (milli: unknown): number =>
+        isFiniteNum(milli) ? Math.round(milli * MILLI_TO_MIN) : 0;
 
-        // Filter by sport if specified
-        const filtered = sport
-          ? mapped.filter((w) => w.sport.toLowerCase() === sport.toLowerCase())
-          : mapped;
-
-        // Compute: last 7 days only
-        const sevenDaysAgo = new Date(daysAgo(7)).toISOString().split("T")[0];
-        const last7 = filtered.filter((w) => w.date >= sevenDaysAgo);
-
-        const weeklyVolumeHrs = Math.round(last7.reduce((s, w) => s + w.duration_min, 0) / 60 * 10) / 10;
-        const weeklyStrainTotal = Math.round(last7.reduce((s, w) => s + w.strain, 0) * 10) / 10;
-
-        // Sport distribution (full window)
-        const sportDist: Record<string, number> = {};
-        for (const w of filtered) {
-          sportDist[w.sport] = (sportDist[w.sport] ?? 0) + 1;
-        }
-
-        // Intensity distribution (last 7 days)
-        let z12 = 0, z3 = 0, z45 = 0;
-        for (const w of last7) {
-          const hz = w.hr_zones_minutes;
-          z12 += hz.zone1 + hz.zone2;
-          z3 += hz.zone3;
-          z45 += hz.zone4 + hz.zone5;
-        }
-        const totalZone = z12 + z3 + z45;
-        const intensityDist = totalZone > 0
-          ? {
-              zone1_2_pct: Math.round((z12 / totalZone) * 100),
-              zone3_pct: Math.round((z3 / totalZone) * 100),
-              zone4_5_pct: Math.round((z45 / totalZone) * 100),
-            }
-          : { zone1_2_pct: 0, zone3_pct: 0, zone4_5_pct: 0 };
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify(
-                {
-                  raw: { workouts: filtered },
-                  computed: {
-                    total_workouts: filtered.length,
-                    weekly_volume_hrs: weeklyVolumeHrs,
-                    weekly_strain_total: weeklyStrainTotal,
-                    sport_distribution: sportDist,
-                    intensity_distribution: intensityDist,
-                  },
-                },
-                null,
-                2
-              ),
+      // Map to readable format — filter out unscored workouts. One dirty record must
+      // degrade gracefully (dropped or nulled), never fail the whole tool: a NaN in a
+      // non-nullable z.number() field would make the SDK reject the entire result.
+      const mapped = workouts
+        .filter((w) => w.score_state === "SCORED" && w.score)
+        .map((w) => {
+          const zd = w.score.zone_durations;
+          const durationMin = Math.round(
+            (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60)
+          );
+          // Core numerics must be finite to aggregate honestly. A bad timestamp (NaN
+          // duration) or dirty strain/kilojoule drops just this workout.
+          if (
+            !isFiniteNum(durationMin) ||
+            !isFiniteNum(w.score.strain) ||
+            !isFiniteNum(w.score.kilojoule)
+          ) {
+            return null;
+          }
+          return {
+            date: w.start.split("T")[0],
+            sport: w.sport_name,
+            strain: w.score.strain,
+            duration_min: durationMin,
+            // avg/max HR are genuinely optional on WHOOP → emit null (NaN would be rejected).
+            avg_hr: nullIfNotFinite(w.score.average_heart_rate),
+            max_hr: nullIfNotFinite(w.score.max_heart_rate),
+            calories: kjToKcal(w.score.kilojoule),
+            hr_zones_minutes: {
+              zone1: zoneMin(zd?.zone_one_milli),
+              zone2: zoneMin(zd?.zone_two_milli),
+              zone3: zoneMin(zd?.zone_three_milli),
+              zone4: zoneMin(zd?.zone_four_milli),
+              zone5: zoneMin(zd?.zone_five_milli),
             },
-          ],
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        return {
-          isError: true,
-          content: [{ type: "text" as const, text: `Error fetching workouts: ${message}` }],
-        };
+          };
+        })
+        .filter((w): w is NonNullable<typeof w> => w !== null);
+
+      // Filter by sport if specified
+      const filtered = sport
+        ? mapped.filter((w) => w.sport.toLowerCase() === sport.toLowerCase())
+        : mapped;
+
+      // Compute: last 7 days only
+      const sevenDaysAgo = new Date(daysAgo(7)).toISOString().split("T")[0];
+      const last7 = filtered.filter((w) => w.date >= sevenDaysAgo);
+
+      const weeklyVolumeHrs = Math.round((last7.reduce((s, w) => s + w.duration_min, 0) / 60) * 10) / 10;
+      const weeklyStrainTotal = Math.round(last7.reduce((s, w) => s + w.strain, 0) * 10) / 10;
+
+      // Sport distribution (full window)
+      const sportDist: Record<string, number> = {};
+      for (const w of filtered) {
+        sportDist[w.sport] = (sportDist[w.sport] ?? 0) + 1;
       }
-    }
+
+      // Intensity distribution (last 7 days)
+      let z12 = 0, z3 = 0, z45 = 0;
+      for (const w of last7) {
+        const hz = w.hr_zones_minutes;
+        z12 += hz.zone1 + hz.zone2;
+        z3 += hz.zone3;
+        z45 += hz.zone4 + hz.zone5;
+      }
+      const totalZone = z12 + z3 + z45;
+      const intensityDist = totalZone > 0
+        ? {
+            zone1_2_pct: Math.round((z12 / totalZone) * 100),
+            zone3_pct: Math.round((z3 / totalZone) * 100),
+            zone4_5_pct: Math.round((z45 / totalZone) * 100),
+          }
+        : { zone1_2_pct: 0, zone3_pct: 0, zone4_5_pct: 0 };
+
+      return {
+        raw: { workouts: filtered },
+        computed: {
+          total_workouts: filtered.length,
+          weekly_volume_hrs: weeklyVolumeHrs,
+          weekly_strain_total: weeklyStrainTotal,
+          sport_distribution: sportDist,
+          intensity_distribution: intensityDist,
+        },
+      };
+    },
   );
 }

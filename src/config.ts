@@ -18,9 +18,16 @@ export interface Config {
   };
   security: {
     encryptionSecret: string;
-    mcpBearerToken: string;
-    mcpOAuthClientId: string;
-    mcpOAuthClientSecret: string;
+    // Optional static bearer token for direct MCP access (curl/scripts). When
+    // unset there is no static auth path — only dynamic OAuth tokens are accepted.
+    mcpBearerToken: string | undefined;
+    // Browser password gating client authorization and WHOOP account linking.
+    accessPassword: string;
+    // Hostnames whose https redirect_uris may be registered by MCP clients
+    // (consent-gate phishing mitigation). Remote defaults are the Claude hosts;
+    // ALLOWED_REDIRECT_HOSTS replaces them when set. localhost/127.0.0.1 are
+    // always allowed separately (http included) and are not listed here.
+    allowedRedirectHosts: string[];
   };
   server: {
     port: number;
@@ -52,6 +59,22 @@ export interface Config {
     ttl_minutes: number;
     history_window_days: number;
   };
+}
+
+// Remote redirect hosts allowed for dynamic client registration when
+// ALLOWED_REDIRECT_HOSTS is unset. localhost/127.0.0.1 are always allowed
+// separately (see isAllowedRedirectUri in server.ts) and are not listed here.
+const DEFAULT_REDIRECT_HOSTS = ["claude.ai", "claude.com", "www.claude.ai", "www.claude.com"];
+
+// ALLOWED_REDIRECT_HOSTS (comma-separated hostnames), when set, REPLACES the
+// remote defaults entirely (localhost stays allowed regardless).
+function resolveAllowedRedirectHosts(): string[] {
+  const raw = process.env.ALLOWED_REDIRECT_HOSTS;
+  if (!raw) return [...DEFAULT_REDIRECT_HOSTS];
+  return raw
+    .split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 function requireEnv(name: string): string {
@@ -113,6 +136,11 @@ function buildConfig(): Config {
     throw new Error("ENCRYPTION_SECRET must be at least 32 characters");
   }
 
+  const accessPassword = requireEnv("ACCESS_PASSWORD");
+  if (accessPassword.length < 12) {
+    throw new Error("ACCESS_PASSWORD must be at least 12 characters");
+  }
+
   const raw = loadConfigFile();
   validateConfig(raw);
 
@@ -129,9 +157,9 @@ function buildConfig(): Config {
     },
     security: {
       encryptionSecret,
-      mcpBearerToken: requireEnv("MCP_BEARER_TOKEN"),
-      mcpOAuthClientId: requireEnv("MCP_OAUTH_CLIENT_ID"),
-      mcpOAuthClientSecret: requireEnv("MCP_OAUTH_CLIENT_SECRET"),
+      mcpBearerToken: process.env.MCP_BEARER_TOKEN || undefined,
+      accessPassword,
+      allowedRedirectHosts: resolveAllowedRedirectHosts(),
     },
     server: {
       port: parseInt(process.env.PORT ?? "3000", 10),

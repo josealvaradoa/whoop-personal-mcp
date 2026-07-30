@@ -1,6 +1,24 @@
 import { config } from "../config.js";
+import type { Workout } from "../whoop/types.js";
+import { roundTo } from "./stats.js";
 import type { Trend } from "./recovery.js";
 import type { AcwrZone } from "./training-load.js";
+
+// Weekly training volume in hours. Only SCORED workouts count (mirrors the workouts
+// tool) — an unscored/in-progress activity must not inflate volume — and non-finite
+// durations (bad timestamps) are skipped rather than poisoning the sum with NaN.
+export function weeklyWorkoutVolumeHrs(workouts: Workout[]): number {
+  return roundTo(
+    workouts
+      .filter((w) => w.score_state === "SCORED" && w.score)
+      .reduce((sum, w) => {
+        const dur =
+          (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60 * 60);
+        return Number.isFinite(dur) ? sum + dur : sum;
+      }, 0),
+    1,
+  );
+}
 
 export type FitnessTrend = "on_track" | "undertrained" | "overreaching" | "injury_risk";
 export type FatigueStatus = "fresh" | "manageable" | "accumulating" | "critical";
@@ -24,25 +42,25 @@ export function getCurrentPhase(): string {
 }
 
 export function computeFitnessTrend(
-  acwrZone: AcwrZone,
-  recoveryTrend: Trend
-): FitnessTrend {
+  acwrZone: AcwrZone | null,
+  recoveryTrend: Trend | null
+): FitnessTrend | null {
+  if (acwrZone === null) return null;
   if (acwrZone === "danger") return "injury_risk";
   if (acwrZone === "caution") return "overreaching";
   if (acwrZone === "undertrained") return "undertrained";
-  if (acwrZone === "optimal" && (recoveryTrend === "stable" || recoveryTrend === "improving")) {
-    return "on_track";
-  }
+  // Optimal zone: declining recovery is an early-overreach signal.
+  if (recoveryTrend === "declining") return "overreaching";
   return "on_track";
 }
 
 export function computeFatigueStatus(
-  avg7d: number,
-  avg30d: number,
+  avg7d: number | null,
+  avg30d: number | null,
   consecutiveRedDays: number
-): FatigueStatus {
+): FatigueStatus | null {
   if (consecutiveRedDays >= config.thresholds.consecutive_red_alert) return "critical";
-  if (avg30d === 0) return "manageable";
+  if (avg7d == null || avg30d == null || avg30d === 0) return null;
   const diff = (avg7d - avg30d) / avg30d;
   if (diff > 0.1) return "fresh";
   if (diff > -0.1) return "manageable";
@@ -50,24 +68,25 @@ export function computeFatigueStatus(
 }
 
 export function computeKeyConcerns(data: {
-  sleepDebtHrs: number;
-  monotony: number;
+  sleepDebtHrs: number | null;
+  monotony: number | null;
   acwr: number | null;
-  recoveryTrend: Trend;
-  hrvTrend: Trend;
-  weeklyVolumeHrs: number;
+  recoveryTrend: Trend | null;
+  hrvTrend: Trend | null;
+  weeklyVolumeHrs: number | null;
   currentPhase: string;
 }): string[] {
   const concerns: string[] = [];
   const t = config.thresholds;
 
-  if (data.sleepDebtHrs < -3) concerns.push("sleep_debt");
-  if (data.monotony > 2.0) concerns.push("high_monotony");
+  if (data.sleepDebtHrs != null && data.sleepDebtHrs < -3) concerns.push("sleep_debt");
+  if (data.monotony != null && data.monotony > 2.0) concerns.push("high_monotony");
   if (data.acwr !== null && data.acwr > t.acwr_danger) concerns.push("acwr_danger");
   else if (data.acwr !== null && data.acwr > t.acwr_optimal_high) concerns.push("acwr_high");
   if (data.recoveryTrend === "declining") concerns.push("declining_recovery");
   if (data.hrvTrend === "declining") concerns.push("declining_hrv");
   if (
+    data.weeklyVolumeHrs != null &&
     data.weeklyVolumeHrs < 5 &&
     (data.currentPhase === "build" || data.currentPhase === "peak")
   ) {
@@ -78,11 +97,11 @@ export function computeKeyConcerns(data: {
 }
 
 export function buildWeeklySummary(data: {
-  recoveryTrend: Trend;
-  acwrZone: AcwrZone;
+  recoveryTrend: Trend | null;
+  acwrZone: AcwrZone | null;
   acwr: number | null;
   concerns: string[];
-  fatigueStatus: FatigueStatus;
+  fatigueStatus: FatigueStatus | null;
 }): string {
   const parts: string[] = [];
 
@@ -91,8 +110,10 @@ export function buildWeeklySummary(data: {
     parts.push("Recovery trending well.");
   } else if (data.recoveryTrend === "declining") {
     parts.push("Recovery has been declining.");
-  } else {
+  } else if (data.recoveryTrend === "stable") {
     parts.push("Recovery is stable.");
+  } else {
+    parts.push("Recovery trend is unavailable (insufficient recent data).");
   }
 
   // ACWR

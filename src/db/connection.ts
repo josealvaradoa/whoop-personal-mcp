@@ -7,7 +7,7 @@ let db: Database.Database | null = null;
 export function getDb(): Database.Database {
   if (db) return db;
 
-  const dbDir = join(process.cwd(), "data");
+  const dbDir = process.env.DATA_DIR ?? join(process.cwd(), "data");
   mkdirSync(dbDir, { recursive: true });
 
   const dbPath = join(dbDir, "whoop-mcp.db");

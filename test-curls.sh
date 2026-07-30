@@ -1,8 +1,12 @@
 #!/bin/bash
-# MCP Server test commands
-# Usage: Run each section separately, replacing SESSION_ID where needed
-
-BEARER="dev-bearer-token-123"
+# MCP Server test commands (dev helper)
+# Usage: Run each section separately, replacing SESSION_ID where needed.
+#
+# BEARER must be the value of your MCP_BEARER_TOKEN env var. This static-bearer
+# path only works when MCP_BEARER_TOKEN is set on the server; if it is unset,
+# there is no static auth and you must use the OAuth flow (see README / agent/SETUP.md).
+# Link your WHOOP account first by opening $BASE/auth/whoop and entering ACCESS_PASSWORD.
+BEARER="your-mcp-bearer-token"
 BASE="http://localhost:3000"
 
 # 1. Health check
@@ -35,14 +39,14 @@ echo "Replace SESSION_ID below with the value from step 3"
 #   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 
 # 5. Call a tool (replace SESSION_ID)
-echo "=== Call get_today_overview ==="
+echo "=== Call whoop_get_today_overview ==="
 echo "Replace SESSION_ID below with the value from step 3"
 # curl -s -X POST "$BASE/mcp" \
 #   -H "Authorization: Bearer $BEARER" \
 #   -H "Content-Type: application/json" \
 #   -H "Accept: application/json, text/event-stream" \
 #   -H "Mcp-Session-Id: SESSION_ID" \
-#   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_today_overview","arguments":{}}}'
+#   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoop_get_today_overview","arguments":{}}}'
 
 # 6. Test rejection — no session ID on non-initialize request
 echo "=== Test No Session (should 400) ==="

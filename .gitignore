@@ -7,3 +7,7 @@ whoop-mcp.config.json
 # Planning artifacts
 .claude/
 PRD.md
+
+# Scratch/probe scripts
+*.tmp.mts
+*.tmp.ts

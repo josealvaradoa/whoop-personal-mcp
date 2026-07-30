@@ -194,6 +194,23 @@ export function invalidateTokenCache(): void {
   cachedExpiresAt = null;
 }
 
+/**
+ * Force a token refresh regardless of the current token's remaining lifetime.
+ *
+ * getValidAccessToken() only refreshes when the stored token is within the 300s
+ * expiry buffer, so a WHOOP-side *early* revocation (which surfaces as a 401 on a
+ * still-"valid" token) would never heal until natural expiry. The 401-retry path
+ * in the WHOOP client calls this instead to guarantee a genuinely new token.
+ *
+ * Delegates to the same single-flight refreshAccessToken() mutex, so concurrent
+ * 401s coalesce into one refresh (WHOOP refresh tokens are single-use). If the
+ * refresh definitively fails (400/401/403 from WHOOP), the existing clear,
+ * re-authorize error is surfaced.
+ */
+export async function forceRefreshAccessToken(): Promise<string> {
+  return refreshAccessToken();
+}
+
 export async function getValidAccessToken(): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
 
