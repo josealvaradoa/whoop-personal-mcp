@@ -1,6 +1,7 @@
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
-import { randomBytes, createHash, timingSafeEqual } from "node:crypto";
+import { randomBytes, createHash, scryptSync, timingSafeEqual } from "node:crypto";
+import { rateLimit } from "express-rate-limit";
 import type { LookupAddress } from "node:dns";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { request as httpsRequest } from "node:https";
@@ -106,13 +107,27 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-// Constant-time secret comparison. Hashing both sides first makes the buffers
-// equal-length (timingSafeEqual throws on length mismatch) and hides input length.
-function secretsMatch(a: string, b: string): boolean {
+// Constant-time comparison for high-entropy bearer tokens. SHA-256 is suitable
+// here because these are random machine credentials, not human passwords.
+function bearerTokensMatch(a: string, b: string): boolean {
   return timingSafeEqual(
     createHash("sha256").update(a).digest(),
     createHash("sha256").update(b).digest()
   );
+}
+
+// Build a verifier once per app so the configured password is scrypt-derived
+// once, while every submitted password still pays the password-KDF cost. The
+// random in-memory salt changes on restart and is never persisted or exposed.
+function createPasswordVerifier(expected: string): (candidate: string) => boolean {
+  const salt = randomBytes(16);
+  const expectedDigest = scryptSync(expected, salt, 32);
+  const expectedByteLength = Buffer.byteLength(expected);
+  return (candidate: string): boolean => {
+    const candidateDigest = scryptSync(candidate, salt, 32);
+    return timingSafeEqual(candidateDigest, expectedDigest) &&
+      Buffer.byteLength(candidate) === expectedByteLength;
+  };
 }
 
 // --- Password-endpoint rate limiting (dependency-free, in-memory, per-IP) ---
@@ -855,7 +870,7 @@ export const oauthProvider: OAuthServerProvider = {
 
     // Check static bearer token (only when one is configured)
     const staticToken = config.security.mcpBearerToken;
-    if (staticToken && secretsMatch(token, staticToken)) {
+    if (staticToken && bearerTokensMatch(token, staticToken)) {
       console.log(`[auth] verifyAccessToken → static bearer token`);
       return {
         token,
@@ -1050,6 +1065,17 @@ export function createApp(): express.Express {
   // through X-Forwarded-For and bypass per-IP password throttling.
   app.set("trust proxy", config.server.trustProxy);
 
+  const verifyAccessPassword = createPasswordVerifier(config.security.accessPassword);
+  // This request-volume limit protects the expensive authorization, database,
+  // and upstream-revocation work on owner auth routes. The stricter failed-
+  // password lockout below remains separate and shared across password forms.
+  const authOperationRateLimit = rateLimit({
+    windowMs: PW_WINDOW_MS,
+    limit: 100,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+  });
+
   const corsAllowlist = new Set(config.security.allowedOrigins);
   const hostAllowlist = new Set(config.security.allowedHosts);
   const isAllowedOrigin = (origin: string): boolean => {
@@ -1146,7 +1172,7 @@ export function createApp(): express.Express {
     const staticToken = config.security.mcpBearerToken;
     const authHeader = req.headers.authorization ?? "";
     const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
-    if (!staticToken || !provided || !secretsMatch(provided, staticToken)) {
+    if (!staticToken || !provided || !bearerTokensMatch(provided, staticToken)) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
@@ -1165,7 +1191,7 @@ export function createApp(): express.Express {
   // Privacy wipe for this one-user deployment. A valid dynamic MCP bearer or
   // the optional static deployment bearer is required; browser cookies are not
   // used, which keeps this endpoint resistant to ambient-authority CSRF.
-  app.post("/auth/disconnect", async (req: Request, res: Response) => {
+  app.post("/auth/disconnect", authOperationRateLimit, async (req: Request, res: Response) => {
     res.setHeader("Cache-Control", "no-store");
     const authHeader = req.headers.authorization ?? "";
     const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
@@ -1185,7 +1211,7 @@ export function createApp(): express.Express {
     const accessPassword = typeof req.body?.access_password === "string"
       ? req.body.access_password
       : "";
-    if (!accessPassword || !secretsMatch(accessPassword, config.security.accessPassword)) {
+    if (!accessPassword || !verifyAccessPassword(accessPassword)) {
       recordPwFailure(req.ip ?? "unknown");
       res.status(403).json({
         error: {
@@ -1224,7 +1250,7 @@ export function createApp(): express.Express {
   });
 
   // Consent gate — validate ACCESS_PASSWORD, then complete the pending MCP authorization.
-  app.post("/auth/consent", (req: Request, res: Response) => {
+  app.post("/auth/consent", authOperationRateLimit, (req: Request, res: Response) => {
     if (rejectIfRateLimited(req, res)) return;
     const body = req.body as { consentId?: unknown; password?: unknown; wellnessConsent?: unknown };
     const consentId = typeof body.consentId === "string" ? body.consentId : "";
@@ -1239,7 +1265,7 @@ export function createApp(): express.Express {
       return;
     }
 
-    const passwordMatches = secretsMatch(password, config.security.accessPassword);
+    const passwordMatches = verifyAccessPassword(password);
     if (!passwordMatches || body.wellnessConsent !== "yes") {
       if (!passwordMatches) recordPwFailure(req.ip ?? "unknown");
       // Re-arm a fresh single-use consentId carrying the same pending params.
@@ -1328,11 +1354,11 @@ export function createApp(): express.Express {
     sendPasswordPage(res, { ...WHOOP_LINK_FORM });
   });
 
-  app.post("/auth/whoop", (req: Request, res: Response) => {
+  app.post("/auth/whoop", authOperationRateLimit, (req: Request, res: Response) => {
     if (rejectIfRateLimited(req, res)) return;
     const body = req.body as { password?: unknown; wellnessConsent?: unknown };
     const password = typeof body.password === "string" ? body.password : "";
-    const passwordMatches = secretsMatch(password, config.security.accessPassword);
+    const passwordMatches = verifyAccessPassword(password);
     if (!passwordMatches || body.wellnessConsent !== "yes") {
       if (!passwordMatches) recordPwFailure(req.ip ?? "unknown");
       console.error(`[auth] POST /auth/whoop REJECTED — wrong password`);
@@ -1356,7 +1382,7 @@ export function createApp(): express.Express {
   });
 
   // Whoop OAuth callback
-  app.get("/auth/whoop/callback", async (req: Request, res: Response) => {
+  app.get("/auth/whoop/callback", authOperationRateLimit, async (req: Request, res: Response) => {
     console.log(`[callback] WHOOP callback received — code=${req.query.code ? "present" : "missing"}, state=${req.query.state ? "present" : "missing"}`);
     const { code, state } = req.query;
 

@@ -852,6 +852,26 @@ describe("protected disconnect and privacy wipe", () => {
   });
 });
 
+describe("Request-volume rate limiting on expensive auth routes", () => {
+  it("caps repeated WHOOP callback requests and publishes retry guidance", async () => {
+    const limitedApp = createApp() as unknown as Express;
+
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const response = await request(limitedApp)
+        .get("/auth/whoop/callback")
+        .query({ state: "invalid-state", code: "unused-code" });
+      expect(response.status, `callback attempt ${attempt + 1} should reach the handler`).toBe(400);
+      expect(response.headers.ratelimit).toBeTruthy();
+    }
+
+    const blocked = await request(limitedApp)
+      .get("/auth/whoop/callback")
+      .query({ state: "invalid-state", code: "unused-code" });
+    expect(blocked.status).toBe(429);
+    expect(blocked.headers["retry-after"]).toBeTruthy();
+  });
+});
+
 // Kept last: the per-IP failed-attempt counter is process-wide, so locking out the
 // (shared) test IP here must not precede other password tests in this file.
 describe("Password rate limiting on password endpoints", () => {

@@ -148,10 +148,13 @@ legacy initialization lifecycle but does not issue or trust an
 <code>Mcp-Session-Id</code>. GET streams and DELETE session teardown are not
 exposed.
 
-Password submissions use timing-safe comparisons and a best-effort in-memory,
-per-IP throttle: five failed attempts in 15 minutes cause a temporary lockout.
-It resets on process restart and depends on correct proxy/IP handling, so apply
-edge rate limits as appropriate. Pending consent/WHOOP states are bounded,
+Owner authorization, disconnect, linking, and callback routes have a
+best-effort in-memory request-volume limit of 100 requests per IP per 15
+minutes. Password submissions are checked with a salted scrypt derivation and
+timing-safe comparison, plus a stricter shared throttle: five failed password
+attempts in 15 minutes cause a temporary lockout. These limits reset on process
+restart and depend on correct proxy/IP handling, so apply edge rate limits as
+appropriate. Pending consent/WHOOP states are bounded,
 single-use where applicable, and expire. Dynamic client records are capped, and
 in-flight MCP work is bounded by the HTTP/runtime limits, but these controls are
 not comprehensive DDoS protection.
