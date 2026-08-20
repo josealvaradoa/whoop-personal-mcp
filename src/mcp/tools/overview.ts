@@ -1,16 +1,16 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { daysAgo, today, getCycles, getRecoveryCollection, getSleepCollection } from "../../whoop/client.js";
 import { config } from "../../config.js";
 import {
-  getReadiness,
-  getRecommendation,
+  getRecoveryBand,
   computeBaselineComparison,
+  cycleDateMap,
   isScoredRecovery,
   type ScoredRecovery,
 } from "../../compute/recovery.js";
 import { mapSleepToDay, isNightSleep } from "../../compute/sleep.js";
-import { kjToKcal, roundTo } from "../../compute/stats.js";
+import { calendarDate, kjToKcal, roundTo } from "../../compute/stats.js";
 import { defineTool, READ_ONLY_ANNOTATIONS, CYCLE_DATING_BUFFER_DAYS } from "./helpers.js";
 
 export function registerOverviewTool(server: McpServer): void {
@@ -20,7 +20,7 @@ export function registerOverviewTool(server: McpServer): void {
     {
       title: "Today's Whoop Overview",
       description:
-        "Get today's Whoop overview: recovery score, HRV, resting heart rate, SpO2, skin temperature, sleep score, sleep duration, strain, and calories. Includes computed readiness assessment (green/yellow/red) and comparison to 30-day baselines. Every metric is null when WHOOP has no scored data for it — null NEVER means zero. Each section reports its own date (cycle_date, recovery_date, sleep_date) so you can detect a stale sync; day_in_progress=true means the strain figure is only today's accumulation so far, not a completed day.",
+        "Get today's WHOOP metrics and limited wellness context. recovery_band reproduces WHOOP's product bands (red 0-33, yellow 34-66, green 67-100); it is not a training prescription, medical assessment, injury prediction, or clearance decision. Baseline comparisons require at least 14 scored observations. Every unavailable metric is null, never zero. Each section reports its own date so callers can detect stale data; day_in_progress=true means Day Strain is still accumulating.",
       inputSchema: {},
       outputSchema: {
         raw: z.object({
@@ -43,11 +43,11 @@ export function registerOverviewTool(server: McpServer): void {
           recovery_available: z.boolean(),
           sleep_available: z.boolean(),
           strain_available: z.boolean(),
-          readiness: z.enum(["green", "yellow", "red"]).nullable(),
+          recovery_band: z.enum(["green", "yellow", "red"]).nullable(),
           hrv_vs_baseline_pct: z.number().nullable(),
           rhr_vs_baseline_pct: z.number().nullable(),
-          last_night_vs_target_hrs: z.number().nullable(),
-          recommendation: z.enum(["full_training", "reduced_intensity", "active_recovery_only"]).nullable(),
+          last_night_vs_configured_target_hrs: z.number().nullable(),
+          wellness_context_only: z.literal(true),
         }),
       },
       annotations: READ_ONLY_ANNOTATIONS,
@@ -55,6 +55,10 @@ export function registerOverviewTool(server: McpServer): void {
     },
     async () => {
       const start = daysAgo(1);
+      // WHOOP filters sleep collections by the sleep start instant. Fetch far
+      // enough back that an ordinary overnight record remains available late
+      // the following evening, then choose by owner-local wake date below.
+      const sleepStart = daysAgo(3);
       const end = today();
       const start30d = daysAgo(30);
 
@@ -65,15 +69,17 @@ export function registerOverviewTool(server: McpServer): void {
       const [cycles, recoveries, sleeps, recoveries30d] = await Promise.all([
         getCycles(daysAgo(1 + CYCLE_DATING_BUFFER_DAYS), end),
         getRecoveryCollection(start, end),
-        getSleepCollection(start, end),
+        getSleepCollection(sleepStart, end),
         getRecoveryCollection(start30d, end),
       ]);
 
-      const cycleDates = new Map(cycles.map((c) => [c.id, c.start.split("T")[0]]));
+      const cycleDates = cycleDateMap(cycles, config.athlete.timezone);
 
       // Most recent cycle — may be in-progress (end === null).
       const latestCycle = [...cycles].sort((a, b) => b.start.localeCompare(a.start))[0] ?? null;
-      const cycleDate = latestCycle ? latestCycle.start.split("T")[0] : null;
+      const cycleDate = latestCycle
+        ? calendarDate(latestCycle.start, config.athlete.timezone)
+        : null;
       const dayInProgress = latestCycle ? latestCycle.end === null : false;
 
       // A single non-finite numeric from WHOOP must degrade to null, never NaN: a NaN
@@ -100,28 +106,37 @@ export function registerOverviewTool(server: McpServer): void {
       const skinTemp = fin(latestRecovery ? latestRecovery.rec.score.skin_temp_celsius : null);
 
       // Most recent night of sleep (naps excluded).
-      const latestNight =
-        sleeps.filter(isNightSleep).sort((a, b) => b.start.localeCompare(a.start))[0] ?? null;
-      const sleepDay = latestNight ? mapSleepToDay(latestNight) : null;
-      // Date the night by its WAKE day so sleep_date lines up with recovery_date /
-      // cycle_date (the morning this sleep belongs to), consistent with the compute layer.
-      const sleepDate = latestNight ? latestNight.end.split("T")[0] : null;
-      const sleepPerfPct = fin(latestNight ? latestNight.score.sleep_performance_percentage : null);
-      const sleepEffPct = fin(latestNight ? latestNight.score.sleep_efficiency_percentage : null);
+      const sleepDay = sleeps
+        .filter(isNightSleep)
+        .map((night) => ({
+          night,
+          day: mapSleepToDay(night, config.athlete.timezone),
+        }))
+        .filter((entry): entry is { night: typeof entry.night; day: NonNullable<typeof entry.day> } =>
+          entry.day != null,
+        )
+        .sort((a, b) =>
+          b.day.date.localeCompare(a.day.date) || b.night.end.localeCompare(a.night.end),
+        )[0]?.day ?? null;
+      // Date the night by its wake date in the configured owner timezone.
+      const sleepDate = sleepDay?.date ?? null;
+      const sleepPerfPct = sleepDay?.performance_pct ?? null;
+      const sleepEffPct = sleepDay?.efficiency_pct ?? null;
       const sleepDurationHrs = fin(sleepDay ? sleepDay.duration_hrs : null);
 
-      const readiness = recoveryScore != null ? getReadiness(recoveryScore) : null;
-      const recommendation = readiness != null ? getRecommendation(readiness) : null;
+      const recoveryBand = recoveryScore != null ? getRecoveryBand(recoveryScore) : null;
 
       const scored30d = recoveries30d.filter(isScoredRecovery);
       // Filter the 30-day baselines to finite values so one dirty record can't NaN the mean.
       const hrvValues30d = scored30d.map((r) => r.score.hrv_rmssd_milli).filter(Number.isFinite);
       const rhrValues30d = scored30d.map((r) => r.score.resting_heart_rate).filter(Number.isFinite);
 
-      const hrvVsBaseline = computeBaselineComparison(hrvRmssd, hrvValues30d);
-      const rhrVsBaseline = computeBaselineComparison(rhr, rhrValues30d);
+      const hrvVsBaseline =
+        hrvValues30d.length >= 14 ? computeBaselineComparison(hrvRmssd, hrvValues30d) : null;
+      const rhrVsBaseline =
+        rhrValues30d.length >= 14 ? computeBaselineComparison(rhr, rhrValues30d) : null;
       const lastNightVsTarget =
-        sleepDurationHrs != null
+        sleepDurationHrs != null && config.athlete.sleep_target_hrs != null
           ? roundTo(sleepDurationHrs - config.athlete.sleep_target_hrs, 1)
           : null;
 
@@ -144,13 +159,13 @@ export function registerOverviewTool(server: McpServer): void {
         },
         computed: {
           recovery_available: latestRecovery != null,
-          sleep_available: latestNight != null,
-          strain_available: latestCycle?.score != null,
-          readiness,
+          sleep_available: sleepDay != null,
+          strain_available: strain != null,
+          recovery_band: recoveryBand,
           hrv_vs_baseline_pct: hrvVsBaseline,
           rhr_vs_baseline_pct: rhrVsBaseline,
-          last_night_vs_target_hrs: lastNightVsTarget,
-          recommendation,
+          last_night_vs_configured_target_hrs: lastNightVsTarget,
+          wellness_context_only: true as const,
         },
       };
     },

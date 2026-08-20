@@ -232,11 +232,17 @@ export function makeSleepDay(opts: {
   date: string;
   durationHrs?: number;
   efficiencyPct?: number | null;
+  sleepNeedHrs?: number | null;
+  whoopSleepDebtHrs?: number | null;
+  consistencyPct?: number | null;
 }): SleepDayData {
   const dur = opts.durationHrs ?? 8;
   return {
     date: opts.date,
     duration_hrs: dur,
+    sleep_need_hrs: withDefault(opts.sleepNeedHrs, null),
+    whoop_sleep_debt_hrs: withDefault(opts.whoopSleepDebtHrs, null),
+    consistency_pct: withDefault(opts.consistencyPct, null),
     efficiency_pct: withDefault(opts.efficiencyPct, 90),
     performance_pct: 85,
     respiratory_rate: 15,

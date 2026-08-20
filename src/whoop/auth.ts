@@ -1,17 +1,52 @@
-import { randomBytes, pbkdf2Sync, createCipheriv, createDecipheriv } from "node:crypto";
-import { getDb } from "../db/connection.js";
+import {
+  createCipheriv,
+  createDecipheriv,
+  pbkdf2Sync,
+  randomBytes,
+} from "node:crypto";
+import { z } from "zod";
 import { config } from "../config.js";
-import type { OAuthTokenResponse } from "./types.js";
+import { getDb } from "../db/connection.js";
 
 const WHOOP_TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token";
 const WHOOP_AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth";
-const SCOPES = "read:recovery read:cycles read:sleep read:workout read:profile read:body_measurement offline";
+const WHOOP_REVOKE_URL = "https://api.prod.whoop.com/developer/v2/user/access";
 
-// In-memory token cache to avoid PBKDF2 on every call
+// Least privilege: registered tools only use cycles, recovery, sleep and workouts.
+const SCOPES = "read:recovery read:cycles read:sleep read:workout offline";
+
+const TokenResponseSchema = z.object({
+  access_token: z.string().min(1),
+  refresh_token: z.string().min(1).optional(),
+  expires_in: z.number().int().positive(),
+  scope: z.string().default(""),
+  token_type: z.string().optional(),
+});
+
+export type WhoopAuthErrorCode =
+  | "AUTH_REQUIRED"
+  | "ACCOUNT_ALREADY_LINKED"
+  | "UPSTREAM_AUTH_REJECTED"
+  | "UPSTREAM_RATE_LIMITED"
+  | "UPSTREAM_TIMEOUT"
+  | "UPSTREAM_UNAVAILABLE"
+  | "UPSTREAM_INVALID_RESPONSE";
+
+export class WhoopAuthError extends Error {
+  constructor(
+    readonly code: WhoopAuthErrorCode,
+    message: string,
+    readonly retryable: boolean,
+    readonly status?: number,
+  ) {
+    super(message);
+    this.name = "WhoopAuthError";
+  }
+}
+
 let cachedAccessToken: string | null = null;
 let cachedExpiresAt: number | null = null;
-
-// --- Encryption ---
+let credentialGeneration = 0;
 
 function deriveKey(secret: string, salt: Buffer): Buffer {
   return pbkdf2Sync(secret, salt, 100_000, 32, "sha256");
@@ -21,107 +56,162 @@ export function encrypt(plaintext: string, secret: string): string {
   const salt = randomBytes(16);
   const iv = randomBytes(12);
   const key = deriveKey(secret, salt);
-
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-
   return [
     salt.toString("base64"),
     iv.toString("base64"),
-    authTag.toString("base64"),
+    cipher.getAuthTag().toString("base64"),
     encrypted.toString("base64"),
   ].join(":");
 }
 
 export function decrypt(encrypted: string, secret: string): string {
   const parts = encrypted.split(":");
-  if (parts.length !== 4) {
-    throw new Error("Malformed encrypted token: expected 4 colon-separated segments");
-  }
-  const [saltB64, ivB64, authTagB64, ciphertextB64] = parts;
-  const salt = Buffer.from(saltB64, "base64");
-  const iv = Buffer.from(ivB64, "base64");
-  const authTag = Buffer.from(authTagB64, "base64");
-  const ciphertext = Buffer.from(ciphertextB64, "base64");
-
-  const key = deriveKey(secret, salt);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAuthTag(authTag);
-
-  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+  if (parts.length !== 4) throw new Error("Malformed encrypted token");
+  const [saltValue, ivValue, authTagValue, ciphertextValue] = parts;
+  const decipher = createDecipheriv(
+    "aes-256-gcm",
+    deriveKey(secret, Buffer.from(saltValue, "base64")),
+    Buffer.from(ivValue, "base64"),
+  );
+  decipher.setAuthTag(Buffer.from(authTagValue, "base64"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(ciphertextValue, "base64")),
+    decipher.final(),
+  ]).toString("utf8");
 }
 
-// --- Token Storage ---
-
-export function storeTokens(
-  accessToken: string,
-  refreshToken: string,
-  expiresIn: number,
-  scope: string
-): void {
-  const secret = config.security.encryptionSecret;
-  const accessEncrypted = encrypt(accessToken, secret);
-  const refreshEncrypted = encrypt(refreshToken, secret);
-  const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
-
-  const db = getDb();
-  db.prepare(`
-    INSERT INTO tokens (id, access_token_encrypted, refresh_token_encrypted, expires_at, scope)
-    VALUES (1, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      access_token_encrypted = excluded.access_token_encrypted,
-      refresh_token_encrypted = excluded.refresh_token_encrypted,
-      expires_at = excluded.expires_at,
-      scope = excluded.scope,
-      updated_at = unixepoch()
-  `).run(accessEncrypted, refreshEncrypted, expiresAt, scope);
-
-  // Update in-memory cache
-  cachedAccessToken = accessToken;
-  cachedExpiresAt = expiresAt;
-}
-
-export function getTokens(): {
+interface StoredTokens {
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
   scope: string;
-} | null {
-  const db = getDb();
-  const row = db.prepare("SELECT * FROM tokens WHERE id = 1").get() as
-    | {
-        access_token_encrypted: string;
-        refresh_token_encrypted: string;
-        expires_at: number;
-        scope: string;
-      }
-    | undefined;
+}
 
+/**
+ * Persist the single linked account's encrypted token rotation.
+ */
+export function storeTokens(
+  accessToken: string,
+  refreshToken: string,
+  expiresIn: number,
+  scope: string,
+): void {
+  const db = getDb();
+  const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+  const accessEncrypted = encrypt(accessToken, config.security.encryptionSecret);
+  const refreshEncrypted = encrypt(refreshToken, config.security.encryptionSecret);
+
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO tokens (id, access_token_encrypted, refresh_token_encrypted, expires_at, scope)
+      VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        access_token_encrypted = excluded.access_token_encrypted,
+        refresh_token_encrypted = excluded.refresh_token_encrypted,
+        expires_at = excluded.expires_at,
+        scope = excluded.scope,
+        updated_at = unixepoch()
+    `).run(accessEncrypted, refreshEncrypted, expiresAt, scope);
+  })();
+
+  cachedAccessToken = accessToken;
+  cachedExpiresAt = expiresAt;
+}
+
+export function getTokens(): StoredTokens | null {
+  const row = getDb().prepare(`
+    SELECT access_token_encrypted, refresh_token_encrypted, expires_at, scope
+    FROM tokens WHERE id = 1
+  `).get() as {
+    access_token_encrypted: string;
+    refresh_token_encrypted: string;
+    expires_at: number;
+    scope: string;
+  } | undefined;
   if (!row) return null;
 
   try {
-    const secret = config.security.encryptionSecret;
     return {
-      accessToken: decrypt(row.access_token_encrypted, secret),
-      refreshToken: decrypt(row.refresh_token_encrypted, secret),
+      accessToken: decrypt(row.access_token_encrypted, config.security.encryptionSecret),
+      refreshToken: decrypt(row.refresh_token_encrypted, config.security.encryptionSecret),
       expiresAt: row.expires_at,
       scope: row.scope,
     };
-  } catch (err) {
-    console.error("Failed to decrypt stored tokens, treating as missing:", err);
+  } catch {
+    console.error("[whoop-auth] stored credentials are unreadable; treating account as unlinked");
     return null;
   }
 }
 
-// --- Token Refresh ---
+function clearWhoopCredentials(): void {
+  credentialGeneration++;
+  cachedAccessToken = null;
+  cachedExpiresAt = null;
+  getDb().transaction(() => {
+    getDb().prepare("DELETE FROM tokens").run();
+  })();
+}
 
 let refreshPromise: Promise<string> | null = null;
 
-async function refreshAccessToken(): Promise<string> {
-  // Prevent concurrent refreshes — Whoop refresh tokens are single-use
-  if (refreshPromise) return refreshPromise;
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
 
+async function timedRequest<T>(
+  url: string,
+  init: RequestInit,
+  handle: (response: Response) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), config.whoop.requestTimeoutMs);
+  timeout.unref();
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    // Keep the timeout armed until the response body (when any) is consumed.
+    return await handle(response);
+  } catch (error) {
+    if (error instanceof WhoopAuthError) throw error;
+    if (isAbortError(error)) {
+      throw new WhoopAuthError("UPSTREAM_TIMEOUT", "WHOOP authorization request timed out", true);
+    }
+    throw new WhoopAuthError("UPSTREAM_UNAVAILABLE", "WHOOP authorization service is unavailable", true);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function classifyStatus(status: number, operation: "exchange" | "refresh"): WhoopAuthError {
+  if (status === 429) {
+    return new WhoopAuthError("UPSTREAM_RATE_LIMITED", "WHOOP rate limited the authorization request", true, status);
+  }
+  if (status === 400 || status === 401 || status === 403) {
+    const message = operation === "refresh"
+      ? "WHOOP authorization expired. Re-link the account."
+      : "WHOOP rejected the authorization request";
+    return new WhoopAuthError("UPSTREAM_AUTH_REJECTED", message, false, status);
+  }
+  return new WhoopAuthError("UPSTREAM_UNAVAILABLE", "WHOOP authorization service returned an error", true, status);
+}
+
+async function parseTokenResponse(response: Response): Promise<z.infer<typeof TokenResponseSchema>> {
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    throw new WhoopAuthError("UPSTREAM_INVALID_RESPONSE", "WHOOP returned an unreadable token response", true);
+  }
+  const parsed = TokenResponseSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new WhoopAuthError("UPSTREAM_INVALID_RESPONSE", "WHOOP returned an invalid token response", true);
+  }
+  return parsed.data;
+}
+
+async function refreshAccessToken(): Promise<string> {
+  if (refreshPromise) return refreshPromise;
   refreshPromise = doRefreshAccessToken();
   try {
     return await refreshPromise;
@@ -131,19 +221,14 @@ async function refreshAccessToken(): Promise<string> {
 }
 
 async function doRefreshAccessToken(): Promise<string> {
-  console.log(`[whoop-auth] Attempting token refresh…`);
   const tokens = getTokens();
-  if (!tokens) {
-    throw new Error("No tokens stored. Please authorize at /auth/whoop");
+  if (!tokens?.refreshToken) {
+    throw new WhoopAuthError("AUTH_REQUIRED", "No WHOOP account is linked. Authorize at /auth/whoop", false);
   }
-
-  if (!tokens.refreshToken) {
-    throw new Error("No refresh token available. Please re-authorize at /auth/whoop");
-  }
-
-  let response: globalThis.Response;
+  const generation = credentialGeneration;
+  let data: z.infer<typeof TokenResponseSchema>;
   try {
-    response = await fetch(WHOOP_TOKEN_URL, {
+    data = await timedRequest(WHOOP_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -153,39 +238,28 @@ async function doRefreshAccessToken(): Promise<string> {
         client_secret: config.whoop.clientSecret,
         scope: "offline",
       }),
+    }, async (response) => {
+      if (!response.ok) {
+        throw classifyStatus(response.status, "refresh");
+      }
+      return parseTokenResponse(response);
     });
-  } catch (networkErr) {
-    // Network error (DNS, timeout, etc.) — do NOT delete tokens, they may still be valid
-    console.error(`[whoop-auth] Token refresh network error (tokens preserved):`, networkErr);
-    throw new Error("Token refresh failed due to network error — will retry on next request");
-  }
-
-  if (!response.ok) {
-    const body = await response.text();
-    console.error(`[whoop-auth] Token refresh FAILED (${response.status}): ${body}`);
-
-    // Only delete tokens for definitive auth failures (token revoked/invalid)
-    if (response.status === 400 || response.status === 401 || response.status === 403) {
-      console.warn(`[whoop-auth] Definitive auth failure (${response.status}) — clearing stored tokens`);
-      cachedAccessToken = null;
-      cachedExpiresAt = null;
-      const db = getDb();
-      db.prepare("DELETE FROM tokens WHERE id = 1").run();
-      throw new Error(
-        `Token refresh failed (${response.status}). Please re-authorize at /auth/whoop`
-      );
+  } catch (error) {
+    if (error instanceof WhoopAuthError) {
+      console.warn(`[whoop-auth] refresh failed (${error.status ?? "network"}, ${error.code})`);
+      if (!error.retryable && error.code === "UPSTREAM_AUTH_REJECTED") clearWhoopCredentials();
     }
-
-    // Transient error (5xx, rate limit, etc.) — preserve tokens for retry
-    console.warn(`[whoop-auth] Transient error (${response.status}) — tokens preserved for retry`);
-    throw new Error(
-      `Token refresh failed (${response.status}) — will retry on next request`
-    );
+    throw error;
   }
-
-  const data = (await response.json()) as OAuthTokenResponse;
-  console.log(`[whoop-auth] Token refresh succeeded — expires_in=${data.expires_in}s`);
-  storeTokens(data.access_token, data.refresh_token, data.expires_in, data.scope);
+  if (generation !== credentialGeneration) {
+    throw new WhoopAuthError("AUTH_REQUIRED", "WHOOP account was disconnected during refresh", false);
+  }
+  storeTokens(
+    data.access_token,
+    data.refresh_token ?? tokens.refreshToken,
+    data.expires_in,
+    data.scope || tokens.scope,
+  );
   return data.access_token;
 }
 
@@ -194,52 +268,25 @@ export function invalidateTokenCache(): void {
   cachedExpiresAt = null;
 }
 
-/**
- * Force a token refresh regardless of the current token's remaining lifetime.
- *
- * getValidAccessToken() only refreshes when the stored token is within the 300s
- * expiry buffer, so a WHOOP-side *early* revocation (which surfaces as a 401 on a
- * still-"valid" token) would never heal until natural expiry. The 401-retry path
- * in the WHOOP client calls this instead to guarantee a genuinely new token.
- *
- * Delegates to the same single-flight refreshAccessToken() mutex, so concurrent
- * 401s coalesce into one refresh (WHOOP refresh tokens are single-use). If the
- * refresh definitively fails (400/401/403 from WHOOP), the existing clear,
- * re-authorize error is surfaced.
- */
 export async function forceRefreshAccessToken(): Promise<string> {
   return refreshAccessToken();
 }
 
 export async function getValidAccessToken(): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
+  if (cachedAccessToken && cachedExpiresAt && cachedExpiresAt - now > 300) return cachedAccessToken;
 
-  // Use in-memory cache if token is still valid (with 5-min buffer)
-  if (cachedAccessToken && cachedExpiresAt && cachedExpiresAt - now > 300) {
-    return cachedAccessToken;
-  }
-
-  // Try to load from DB
   const tokens = getTokens();
   if (!tokens) {
-    console.error(`[whoop-auth] getValidAccessToken — no tokens in DB`);
-    throw new Error("No tokens stored. Please authorize at /auth/whoop");
+    throw new WhoopAuthError("AUTH_REQUIRED", "No WHOOP account is linked. Authorize at /auth/whoop", false);
   }
-
-  // If token is still valid, cache and return
   if (tokens.expiresAt - now > 300) {
-    console.log(`[whoop-auth] getValidAccessToken — loaded from DB, expires in ${tokens.expiresAt - now}s`);
     cachedAccessToken = tokens.accessToken;
     cachedExpiresAt = tokens.expiresAt;
     return tokens.accessToken;
   }
-
-  // Token expiring soon — refresh
-  console.log(`[whoop-auth] getValidAccessToken — token expires in ${tokens.expiresAt - now}s, refreshing`);
   return refreshAccessToken();
 }
-
-// --- OAuth Flow ---
 
 export function buildAuthUrl(state: string): string {
   const params = new URLSearchParams({
@@ -253,8 +300,15 @@ export function buildAuthUrl(state: string): string {
 }
 
 export async function exchangeCodeForTokens(code: string): Promise<void> {
-  console.log(`[whoop-auth] Exchanging authorization code for tokens (redirect_uri=${config.whoop.redirectUri})`);
-  const response = await fetch(WHOOP_TOKEN_URL, {
+  if (getTokens()) {
+    throw new WhoopAuthError(
+      "ACCOUNT_ALREADY_LINKED",
+      "A WHOOP account is already linked. Disconnect it before linking another account.",
+      false,
+    );
+  }
+  const generation = credentialGeneration;
+  const data = await timedRequest(WHOOP_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
@@ -264,26 +318,71 @@ export async function exchangeCodeForTokens(code: string): Promise<void> {
       client_secret: config.whoop.clientSecret,
       redirect_uri: config.whoop.redirectUri,
     }),
+  }, async (response) => {
+    if (!response.ok) {
+      const error = classifyStatus(response.status, "exchange");
+      console.warn(`[whoop-auth] exchange failed (${response.status}, ${error.code})`);
+      throw error;
+    }
+    return parseTokenResponse(response);
   });
+  if (!data.refresh_token) {
+    throw new WhoopAuthError("UPSTREAM_INVALID_RESPONSE", "WHOOP did not return an offline refresh token", true);
+  }
+  if (generation !== credentialGeneration || getTokens()) {
+    throw new WhoopAuthError("ACCOUNT_ALREADY_LINKED", "A WHOOP account was linked concurrently", false);
+  }
+  storeTokens(data.access_token, data.refresh_token, data.expires_in, data.scope);
+}
 
-  if (!response.ok) {
-    const body = await response.text();
-    console.error(`[whoop-auth] Token exchange FAILED (${response.status}): ${body}`);
-    throw new Error(`Token exchange failed (${response.status}): ${body}`);
+export interface DisconnectResult {
+  revocation: "not_needed" | "succeeded" | "failed" | "unavailable";
+}
+
+/** Atomic local privacy wipe followed by best-effort remote revocation. */
+export async function disconnectAndDeleteData(): Promise<DisconnectResult> {
+  // Check row existence separately from decryptability. If the encryption key
+  // was rotated or the row is corrupt, getTokens() correctly refuses to expose
+  // credentials, but the upstream WHOOP grant may still exist and must not be
+  // reported as "not needed".
+  const hadStoredAccount = Boolean(
+    getDb().prepare("SELECT 1 FROM tokens WHERE id = 1").get(),
+  );
+  const tokens = hadStoredAccount ? getTokens() : null;
+  let revocation: DisconnectResult["revocation"] = hadStoredAccount
+    ? "unavailable"
+    : "not_needed";
+
+  // Local privacy and authorization state is invalidated before any network
+  // wait. The captured access token is used only for best-effort remote revoke;
+  // a timeout, crash, or upstream outage cannot leave local bearers usable.
+  credentialGeneration++;
+  cachedAccessToken = null;
+  cachedExpiresAt = null;
+  const db = getDb();
+  db.transaction(() => {
+    db.prepare("DELETE FROM tokens").run();
+    db.prepare("DELETE FROM mcp_access_tokens").run();
+    db.prepare("DELETE FROM mcp_refresh_tokens").run();
+    db.prepare("DELETE FROM mcp_clients").run();
+  })();
+
+  if (tokens) {
+    revocation = "failed";
+    try {
+      const result = await timedRequest(WHOOP_REVOKE_URL, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${tokens.accessToken}` },
+      }, async (response) => {
+        return { ok: response.ok, status: response.status };
+      });
+      revocation = result.ok ? "succeeded" : "failed";
+      if (!result.ok) console.warn(`[whoop-auth] remote revoke failed (${result.status}); local data will still be deleted`);
+    } catch (error) {
+      const code = error instanceof WhoopAuthError ? error.code : "UPSTREAM_UNAVAILABLE";
+      console.warn(`[whoop-auth] remote revoke failed (${code}); local data will still be deleted`);
+    }
   }
 
-  const data = (await response.json()) as Record<string, unknown>;
-  console.log(`[whoop-auth] Token exchange response keys: ${JSON.stringify(Object.keys(data))}`);
-
-  const accessToken = data.access_token as string | undefined;
-  const refreshToken = data.refresh_token as string | undefined;
-  const expiresIn = data.expires_in as number | undefined;
-  const scope = data.scope as string | undefined;
-
-  if (!accessToken || !expiresIn) {
-    throw new Error(`Unexpected token response shape: ${JSON.stringify(Object.keys(data))}`);
-  }
-
-  storeTokens(accessToken, refreshToken ?? "", expiresIn, scope ?? "");
-  console.log(`[whoop-auth] Tokens stored — expires_in=${expiresIn}s, scope=${scope ?? "none"}`);
+  return { revocation };
 }

@@ -1,253 +1,261 @@
-# whoop-ironman-mcp
+<!-- mcp-name: io.github.josealvaradoa/whoop-personal-mcp -->
 
-A remote MCP server that connects WHOOP fitness tracker data to Claude for AI-powered Ironman 70.3 training coaching.
+# WHOOP Personal MCP
 
-> The npm package is named `whoop-ironman-mcp`; the GitHub repository is [`whoop-mcp-openclaw`](https://github.com/josealvaradoa/whoop-mcp-openclaw).
+A single-user, self-hosted MCP server that gives an AI client read-only access
+to one owner's WHOOP wellness and training data. It natively serves the
+stateless MCP <code>2026-07-28</code> Streamable HTTP protocol, retains a
+stateless fallback for 2025-era clients, supports MCP OAuth, and works with
+Grok Build and xAI clients, Claude, Codex, OpenClaw, and compatible clients.
 
-**Demo:** _Coming soon._
-<!-- Owner TODO: add a screenshot or short GIF of Claude giving a training recommendation from live WHOOP data. -->
+> **Distribution status:** install from a reviewed source checkout today. The
+> <code>whoop-personal-mcp</code> npm package, an official container image, and
+> <code>io.github.josealvaradoa/whoop-personal-mcp</code> in the MCP Registry are **not
+> yet published or registered**. The metadata in this repository prepares those
+> releases; it does not claim they exist.
 
-## What It Does
+## Is this the right WHOOP MCP for you?
 
-- Pulls real-time biometric data from your WHOOP (recovery, HRV, sleep, strain, workouts)
-- Computes training metrics: ACWR, sleep debt, recovery trends, race readiness
-- Exposes 7 read-only MCP tools that Claude can call to make daily training recommendations
-- Includes a Claude Project template that turns Claude into an Ironman 70.3 coach
+This project is a strong fit if you want to own the deployment and secrets,
+connect one personal WHOOP account, and expose focused, structured summaries to
+a remote-HTTP MCP client. It keeps missing values explicit, includes data
+freshness/coverage, and has no maintainer telemetry.
 
-## Architecture
+Choose something else if you need:
 
-```
-Claude (mobile / desktop / claude.ai)
-        |
-        v  MCP Streamable HTTP over HTTPS  (SSE is the response mode)
-+---------------------------------------------------+
-|     whoop-ironman-mcp                             |
-|     (Node.js + TypeScript, Express)               |
-|                                                   |
-|  OAuth authorization server (for MCP clients)     |
-|   - /authorize -> consent gate (ACCESS_PASSWORD)  |
-|   - /token, /register (dynamic client reg. + PKCE)|
-|   - MCP tokens stored as SHA-256 hashes           |
-|                                                   |
-|  MCP transport                                    |
-|   - POST /mcp    (JSON-RPC requests)              |
-|   - GET  /mcp    (SSE notifications)              |
-|   - DELETE /mcp  (close session)                  |
-|   - Bearer auth (OAuth token, or optional static) |
-|   - 7 read-only tools, one server per session     |
-|                                                   |
-|  WHOOP account linking                            |
-|   - /auth/whoop  (password-gated)                 |
-|   - /auth/whoop/callback                          |
-|   - tokens encrypted at rest (AES-256-GCM/PBKDF2) |
-|   - single-flight refresh (single-use tokens)     |
-|                                                   |
-|  Compute layer (pure functions)                   |
-|   - ACWR, monotony, trends, race readiness        |
-|                                                   |
-|  SQLite (better-sqlite3, WAL)                     |
-|   - encrypted WHOOP tokens (single row)           |
-|   - hashed MCP tokens + registered clients        |
-|   - cached API responses                          |
-+---------------------------------------------------+
-        |
-        v  HTTPS
-   WHOOP API v2
-```
+- a hosted, zero-operations connector;
+- multiple people, a team, patients, customers, roles, or tenant isolation;
+- writes back to WHOOP;
+- MCP over local stdio instead of an HTTP service;
+- every raw WHOOP field rather than six focused tools plus an optional event
+  context tool;
+- active-active replicas or enterprise high availability; or
+- medical advice, diagnosis, injury prediction, or clinical compliance.
 
-## Deploy on Railway
+There is no universal “best” WHOOP MCP. The meaningful differences are trust
+model, deployment burden, protocol/client support, data semantics, maintenance,
+and whether a project is honest about missing data and health-related limits.
+Review [the architecture](docs/architecture.md), [security model](SECURITY.md),
+and [privacy flow](PRIVACY.md) before deciding.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template)
+## MCP version support
 
-> Note: this button points to Railway's generic template page, not a preconfigured template for this project.
+One authenticated <code>POST /mcp</code> endpoint serves both protocol eras:
 
-After deploying:
+- native <code>2026-07-28</code>: <code>server/discover</code>, a per-request
+  <code>_meta</code> envelope and routing headers, no initialization handshake,
+  and no protocol session; and
+- legacy <code>2024-10-07</code> through <code>2025-11-25</code>: the older
+  initialization handshake with a stateless POST-only fallback and no
+  <code>Mcp-Session-Id</code>.
 
-- Set the environment variables from the table below in the Railway dashboard.
-- Set `PUBLIC_URL` and `WHOOP_REDIRECT_URI` to your Railway URL (e.g. `https://your-app.railway.app` and `https://your-app.railway.app/auth/whoop/callback`), and register that redirect URI in your WHOOP app at developer.whoop.com.
-- Attach a persistent volume at `/app/data` so the SQLite database (encrypted tokens) survives redeploys. `DATA_DIR` defaults to `./data` (i.e. `/app/data`).
+Client vendors adopt MCP revisions on their own schedules. This project does
+not infer support from a product name: a current client may select the 2026 era,
+while an older client can use the fallback. Legacy GET streams, DELETE session
+teardown, and the deprecated HTTP+SSE transport are not exposed. Read
+[the protocol compatibility reference](docs/protocol-compatibility.md) for the
+wire behavior and current client-support caveat.
 
-## Quick Start
+## What it provides
 
-### 1. Clone and install
+| Tool | What it returns |
+|---|---|
+| <code>whoop_get_today_overview</code> | Latest recovery, HRV, resting heart rate, sleep, Day Strain, dates, availability, and limited personal-baseline context. |
+| <code>whoop_get_recovery_trend</code> | Recent WHOOP Recovery averages, product-band streaks, trend, coverage, and freshness. |
+| <code>whoop_get_hrv_trend</code> | Personal HRV averages, coefficient of variation, trend, coverage, and freshness. |
+| <code>whoop_get_sleep_trend</code> | Scored nightly sleep, WHOOP Sleep Need/debt, configured-duration balance, neutral duration direction, efficiency, consistency, and freshness. |
+| <code>whoop_get_training_load</code> | Descriptive 7/28-day Day Strain means and a clearly labeled experimental ratio of those means, available only with complete windows. WHOOP Strain is nonlinear; do not use the ratio for injury risk, training decisions, periodization, or clearance. |
+| <code>whoop_get_workouts</code> | Scored workout history, duration, heart rate/zones, recent volume, sport distribution, and intensity distribution. |
+| <code>whoop_get_event_context</code> | **Optional:** event-phase wellness context that abstains when inputs are missing/stale; not a readiness score or clearance. |
 
-```bash
-git clone https://github.com/josealvaradoa/whoop-mcp-openclaw.git
-cd whoop-mcp-openclaw
-corepack enable
-pnpm install
-```
+The first six tools are always available. The optional tool is registered only
+when the active configuration contains a valid <code>event</code> block. All tools are
+read-only with respect to WHOOP. A <code>null</code> means no scored value was
+available; it never means zero.
 
-### 2. Configure environment
+## Quick start: Docker Compose + Grok Build
 
-```bash
+You need a WHOOP membership, a personal app in the
+[WHOOP Developer Dashboard](https://developer.whoop.com/), Git, Node.js 22+ for
+the initializer, and Docker Compose.
+
+Register this exact local redirect URI:
+
+~~~text
+http://localhost:3000/auth/whoop/callback
+~~~
+
+Enable only the scopes the runtime requests:
+
+~~~text
+read:recovery read:cycles read:sleep read:workout offline
+~~~
+
+Then:
+
+~~~bash
+git clone https://github.com/josealvaradoa/whoop-personal-mcp.git
+cd whoop-personal-mcp
+node bin/whoop-personal-mcp.js init
+~~~
+
+On POSIX systems, the non-overwriting initializer requests private mode-0600
+files, generates the
+two local security values,
+detects an IANA timezone, and leaves WHOOP credentials blank. It never
+overwrites an existing <code>.env</code> or active config.
+On Windows, verify file ACLs yourself and prefer the platform's secret store.
+
+Edit <code>.env</code> with the WHOOP client values. If you are using Docker on a
+machine without Node, create the files manually instead:
+
+~~~bash
 cp .env.example .env
-```
-
-Edit `.env` (see [Environment Variables](#environment-variables-env) for the full list). At minimum you need:
-
-- `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET`, `WHOOP_REDIRECT_URI` — from developer.whoop.com
-- `ENCRYPTION_SECRET` — 32+ random characters (e.g. `openssl rand -base64 32`)
-- `ACCESS_PASSWORD` — 12+ characters; you type this in the browser to authorize access
-
-Both length rules are enforced at boot: if `ENCRYPTION_SECRET` is under 32 chars or `ACCESS_PASSWORD` is under 12, the server exits with a clear error.
-
-### 3. Configure your training profile
-
-```bash
 cp whoop-mcp.config.example.json whoop-mcp.config.json
-```
+openssl rand -base64 48
+openssl rand -base64 24
+~~~
 
-Edit the `athlete`, `race`, and `thresholds` blocks. (If you skip this step the server falls back to the example file.)
+Put those outputs in <code>ENCRYPTION_SECRET</code> and
+<code>ACCESS_PASSWORD</code>. Review <code>whoop-mcp.config.json</code>. Replace
+the null sleep target only if
+you intentionally choose a personal duration target; it is never assumed.
+The initializer creates no event. To enable optional event context, add and
+edit the block from
+[templates/event-config.example.json](templates/event-config.example.json).
+The safe-to-copy main example also contains no event. Start the server:
 
-### 4. Build and run
+~~~bash
+docker compose up --build -d
+curl --fail http://localhost:3000/health
+~~~
 
-```bash
-pnpm run build
-node dist/index.js
-```
+Open <http://localhost:3000/auth/whoop>, enter
+<code>ACCESS_PASSWORD</code>, acknowledge the wellness-only notice, and approve
+WHOOP access. The deployment never receives your WHOOP password.
 
-The server listens on `PORT` (default `3000`).
+Every owner must use their own WHOOP Developer app/credentials and comply with
+the current [WHOOP API Terms of Use](https://developer.whoop.com/api-terms-of-use/).
+Remote use requires HTTPS. Explicitly consent before sending a tool result to an
+AI provider; on termination, disconnect/revoke and remove local, backup, and
+provider-side copies as applicable. The server stores no WHOOP API responses.
 
-### 5. Connect Claude (OAuth — recommended)
+Connect [Grok Build](https://docs.x.ai/build/features/mcp-servers):
 
-1. In Claude.ai, go to **Settings → Connectors → Add custom connector**.
-2. Enter your server's public URL ending in `/mcp` (e.g. `https://your-app.railway.app/mcp`). Leave the token field blank.
-3. Claude registers itself and starts the OAuth flow. A browser page appears asking for your `ACCESS_PASSWORD` — this is the **consent gate**. Enter it to approve.
-4. **First time only:** you are then sent to WHOOP to sign in and authorize. After that your account is linked and Claude is connected.
+~~~bash
+grok mcp add --transport http whoop-personal http://localhost:3000/mcp
+grok mcp doctor whoop-personal
+~~~
 
-> Claude's servers must be able to reach your URL, so the OAuth connector needs a public deployment (Railway, or a tunnel such as ngrok). `http://localhost:3000` works for local curl testing but not for the cloud connector.
+Grok opens the server's MCP OAuth flow. Confirm the destination and enter
+<code>ACCESS_PASSWORD</code>. Then ask:
 
-### 5b. Static bearer token (optional — curl/scripts)
+> List the WHOOP tools available, then summarize today's data. State when any
+> value is missing or stale, and do not give medical advice.
 
-Only if you set `MCP_BEARER_TOKEN`:
+For a slower, fully explained walkthrough, use
+[the getting-started tutorial](docs/getting-started.md).
 
-1. Set `MCP_BEARER_TOKEN` in `.env` and restart.
-2. Link WHOOP once: open `<server>/auth/whoop` in a browser and enter your `ACCESS_PASSWORD`.
-3. Call `/mcp` with the header `Authorization: Bearer <MCP_BEARER_TOKEN>`. See [`test-curls.sh`](test-curls.sh).
+## Connect another client
 
-When `MCP_BEARER_TOKEN` is unset there is no static auth path — only the OAuth flow can authenticate.
+- [Grok Build, Grok web, or the xAI Responses API](docs/clients.md#grok)
+- [Claude custom connectors](docs/clients.md#claude)
+- [Codex](docs/clients.md#codex)
+- [OpenClaw](docs/clients.md#openclaw)
+- [Any Streamable HTTP client](docs/clients.md#any-streamable-http-client)
+- [Provider-specific examples](examples/README.md)
 
-### 6. Ask Claude
+Provider-hosted clients cannot reach localhost. Deploy the server at a stable
+public HTTPS origin first, set <code>PUBLIC_URL</code>, register the exact WHOOP
+callback, and follow [the deployment guide](docs/deployment.md). Railway is
+documented as one optional target; any suitable OCI host works.
 
-> "What should I do today?"
+## Data, privacy, and safety
 
-## MCP Tools Reference
+The data path is:
 
-| Tool | Description |
-|------|-------------|
-| `whoop_get_today_overview` | Latest recovery score, HRV, RHR, SpO2, skin temp, sleep, strain, and calories, with a green/yellow/red readiness assessment and 30-day baseline comparisons. Each section reports its own date so a stale sync is visible. |
-| `whoop_get_training_load` | 7-day acute load, 28-day chronic load, ACWR, monotony, and trend direction, plus per-window data-completeness counts. (`days`: 28–365, default 42) |
-| `whoop_get_recovery_trend` | 7- and 30-day rolling recovery averages, trend direction, and consecutive green/yellow/red day counts. (`days`: 7–365, default 30) |
-| `whoop_get_hrv_trend` | HRV baseline, current 7-day average, coefficient of variation, and trend direction. (`days`: 7–365, default 30) |
-| `whoop_get_sleep_trend` | Sleep duration, efficiency, consistency, and cumulative sleep debt. Naps and unscored records are excluded. (`days`: 3–365, default 14) |
-| `whoop_get_workouts` | Workout history with sport, strain, HR data, and HR-zone distribution, plus weekly volume and intensity. Optional `sport` filter. (`days`: 1–365, default 14) |
-| `whoop_get_race_readiness` | Days to race, current periodization phase, fitness trend, fatigue status, key concerns, and a weekly summary. |
+~~~text
+WHOOP -> your deployment -> your chosen MCP client / AI provider
+~~~
 
-**Structured output and `null` semantics.** Every tool returns MCP structured output — a `structuredContent` object validated against an output schema, plus the same JSON as a text block. A metric returned as `null` means WHOOP has no scored data for it (no sync, strap not worn, or scoring still pending) — **`null` never means zero**. This is deliberate: the consumer is a language model, so "no data" must be distinguishable from "a real value of 0." The overview also exposes `recovery_available` / `sleep_available` / `strain_available` flags and per-section dates so the model can detect and report stale or missing data instead of inventing a recommendation.
+The maintainers receive nothing from that path. There is no maintainer
+telemetry, analytics, advertising SDK, or automatic crash reporting. WHOOP
+API responses and tool results are processed in memory and are not persisted.
+The server never receives or stores the AI model's response.
 
-## Security model
+Your hosting provider and AI provider can still process or retain data under
+their policies. One owner may connect several clients, but every client sees the
+same owner's data. Never use one instance for multiple people. Read
+[PRIVACY.md](PRIVACY.md) for storage, provider processing, disconnect, and
+deletion limits.
 
-This is a **single-tenant** server: one WHOOP account per deployment, stored in a single-row tokens table. It is meant to be deployed by the athlete, for the athlete.
+This is a wellness tool, not medical advice, a medical device, injury
+prediction, treatment, or clearance. It is not represented as HIPAA compliant
+and is not offered to covered entities or business associates. See
+[DISCLAIMER.md](DISCLAIMER.md).
 
-- **Consent gate.** Connecting a new MCP client, or linking a WHOOP account, requires entering `ACCESS_PASSWORD` in the browser. An earlier version auto-approved any client that reached the server URL; the consent gate closes that hole (see [SECURITY.md](SECURITY.md)).
-- **Encryption at rest.** WHOOP access/refresh tokens are encrypted with AES-256-GCM using a PBKDF2-derived key (random salt + IV per encryption).
-- **Hashed MCP tokens.** MCP access/refresh tokens are stored as SHA-256 hashes, so a database leak yields no usable credentials.
-- **Redirect-host allowlist.** Dynamic client registration only accepts `redirect_uri`s that are https on an allow-listed host (`claude.ai`/`claude.com` by default, or `ALLOWED_REDIRECT_HOSTS`), matched exactly — so an attacker cannot register a "Claude"-named client that points authorization codes at their own domain. The consent page also shows the concrete destination host.
-- **Timing-safe comparisons**, a **per-IP password rate limit** on the browser password endpoints, and a **CORS allowlist** (`claude.ai`, `claude.com`, localhost, plus anything in `CORS_ORIGINS`).
+## Security summary
 
-This project went through a full security audit; [SECURITY.md](SECURITY.md) documents the threat model and the specific attack the consent gate closes.
+- WHOOP tokens are encrypted at rest with AES-256-GCM.
+- Issued MCP access/refresh tokens are stored as SHA-256 hashes.
+- MCP OAuth uses PKCE, exact redirect checks, short-lived access tokens,
+  rotating refresh tokens when the client declares that grant, an RFC 9207
+  issuer, and the minimal
+  <code>mcp:read</code> scope. It prefers CIMD while retaining DCR for older
+  clients.
+- <code>ACCESS_PASSWORD</code> gates both client consent and WHOOP linking.
+- <code>/mcp</code> validates bearer auth, Host, and browser Origin.
+- <code>POST /auth/disconnect</code> requires a valid MCP bearer plus the owner
+  <code>ACCESS_PASSWORD</code>, attempts WHOOP revocation, wipes local
+  owner/client/token data, and stops active MCP work/response streams.
 
-## Configuration
+The design still depends on correct HTTPS ingress, secret management, provider
+selection, backups, and a single trusted owner. It has not been independently
+certified. Read [SECURITY.md](SECURITY.md) before internet exposure.
+Direct CLI/package runs bind to <code>127.0.0.1</code> by default. Container and
+remote deployments must deliberately set <code>BIND_HOST=0.0.0.0</code> behind
+their restricted ingress.
 
-### Environment Variables (`.env`)
+## Configuration and operations
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `WHOOP_CLIENT_ID` | Yes | OAuth client ID from developer.whoop.com |
-| `WHOOP_CLIENT_SECRET` | Yes | OAuth client secret from developer.whoop.com |
-| `WHOOP_REDIRECT_URI` | Yes | WHOOP OAuth callback. Local: `http://localhost:3000/auth/whoop/callback`. Prod: `https://<your-app>.railway.app/auth/whoop/callback` — must match the URI registered in your WHOOP app |
-| `ENCRYPTION_SECRET` | Yes | 32+ char secret; derives the AES-256-GCM key (PBKDF2) used to encrypt WHOOP tokens at rest |
-| `ACCESS_PASSWORD` | Yes | 12+ char password entered in the browser to authorize a client or link WHOOP (the consent gate) |
-| `MCP_BEARER_TOKEN` | No | Static bearer token for direct MCP access via curl/scripts, sent as `Authorization: Bearer <token>` to `/mcp`. When unset, only the OAuth flow can authenticate |
-| `PORT` | No | HTTP port (default `3000`) |
-| `NODE_ENV` | No | `development` or `production` (default `development`) |
-| `PUBLIC_URL` | No | Public base URL used as the OAuth issuer. Set to your Railway URL in production (default `http://localhost:<PORT>`) |
-| `CORS_ORIGINS` | No | Comma-separated extra CORS origins, additive to the built-in allowlist (`claude.ai`, `claude.com`, and any localhost) |
-| `ALLOWED_REDIRECT_HOSTS` | No | Comma-separated hostnames whose **https** `redirect_uri`s may be registered by MCP clients. When set it **replaces** the built-in defaults (`claude.ai`, `claude.com`, `www.claude.ai`, `www.claude.com`); `localhost`/`127.0.0.1` are always allowed |
-| `DATA_DIR` | No | Directory for the SQLite database (default `./data`) |
+- [Configuration, tools, routes, and token lifetimes](docs/configuration.md)
+- [MCP 2026-07-28 and legacy-era compatibility](docs/protocol-compatibility.md)
+- [CLI init, local/remote doctor, and server start](docs/cli.md)
+- [Docker Compose, any OCI host, and optional Railway deployment](docs/deployment.md)
+- [Client setup](docs/clients.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Architecture and trust boundaries](docs/architecture.md)
+- [Full documentation index](docs/index.md)
 
-### Training Config (`whoop-mcp.config.json`)
+The npm executable described by the package metadata starts this HTTP server;
+it is not an stdio MCP command. Until the package is published, use the source
+checkout.
 
-Copy `whoop-mcp.config.example.json` to `whoop-mcp.config.json` and customize:
+Repository changes go through a protected pull-request workflow. See the
+[contribution guide](CONTRIBUTING.md), [governance policy](GOVERNANCE.md),
+[maintainer list](MAINTAINERS.md), and [Code of Conduct](CODE_OF_CONDUCT.md).
 
-- **athlete**: name, sleep target, max HR, resting-HR baseline
-- **race**: race name, date, type, and training phases with date ranges
-- **thresholds**: ACWR danger/optimal zones, recovery color thresholds, HRV concern level
-- **cache**: TTL and history window
+## Develop and verify
 
-## Training Agent Setup
+Use Node.js 22 or 24 and pnpm 10:
 
-See [agent/SETUP.md](agent/SETUP.md) for step-by-step instructions to set up Claude as your Ironman training coach.
+~~~bash
+corepack enable
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm run lint
+pnpm test
+pnpm run smoke:package
+~~~
 
-## Development
+Start from source with <code>pnpm run dev</code> or build and run with
+<code>pnpm run build && pnpm start</code>. Tests use fixtures and do not need
+live WHOOP credentials. See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[release checklist](docs/releasing.md).
 
-### Run locally
+## License and independence
 
-```bash
-pnpm run dev          # Run with tsx (no build step)
-pnpm run build        # Compile TypeScript
-pnpm run start        # Run compiled JS
-pnpm run typecheck    # Type check without emitting
-pnpm run lint         # ESLint
-```
-
-### Project structure
-
-```
-src/
-  index.ts              Entry point
-  server.ts             Express app, OAuth provider + consent gate, WHOOP linking, CORS
-  config.ts             Config loader and validator
-  whoop/
-    auth.ts             WHOOP OAuth flow, token encryption (AES-256-GCM), refresh
-    client.ts           WHOOP API v2 client with pagination and caching
-    types.ts            TypeScript types for WHOOP API responses
-  db/
-    connection.ts       SQLite singleton (better-sqlite3, WAL mode)
-    schema.ts           Tables (tokens, cache, mcp_clients, mcp_access/refresh_tokens)
-    cache.ts            TTL-based cache read/write/cleanup
-  compute/
-    training-load.ts    ACWR, monotony, trend direction
-    recovery.ts         Recovery trends, readiness, baseline comparison
-    sleep.ts            Sleep debt, consistency, duration trends
-    hrv.ts              HRV baseline, coefficient of variation
-    race-readiness.ts   Phase detection, fitness/fatigue assessment
-    stats.ts            Shared math helpers (mean, stddev, rounding, kJ->kcal)
-  mcp/
-    setup.ts            MCP transport, session management, tool registration
-    tools/              7 tool implementations + shared defineTool helper
-agent/
-  SYSTEM_PROMPT.md      Claude coaching persona instructions
-  TRAINING_CONTEXT.md   Athlete profile template
-  PERIODIZATION_GUIDE.md  Training reference document
-  SETUP.md              How to set up the Claude Project
-```
-
-## How the Computed Metrics Work
-
-### ACWR (Acute-to-Chronic Workload Ratio)
-Compares your last 7 days of training strain to your 28-day average. Values between 0.8–1.3 are optimal. Above 1.5 signals injury risk. Below 0.8 means you're undertrained. In-progress days are excluded, and ACWR is reported as `null` when fewer than 4 of the last 7 days have data (rather than a misleadingly low number).
-
-### Training Monotony
-How repetitive your training is. High monotony (> 2.0) means every day looks the same — your body needs variety to adapt without breaking down.
-
-### Sleep Debt
-`whoop_get_sleep_trend` reports the cumulative difference between actual sleep and your target across the window; a debt of -4.5 hours means you've under-slept by almost a full night over a week. The overview separately reports only last night versus target (`last_night_vs_target_hrs`) — same idea, different window, so they aren't conflated.
-
-### Race Readiness
-Combines ACWR, recovery trend, HRV, sleep, and your training phase into a single assessment: fitness trend (`on_track`, `undertrained`, `overreaching`, `injury_risk`), fatigue status, and specific concerns to address.
-
-## License
-
-MIT
+[MIT](LICENSE). Provided without warranty under the license terms. This
+independent project is not affiliated with, endorsed by, or sponsored by WHOOP,
+xAI, Anthropic, OpenAI, OpenClaw, Railway, or any other client/hosting provider.
+Their names and trademarks belong to their respective owners.

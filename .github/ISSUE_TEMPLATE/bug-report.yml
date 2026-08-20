@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible, non-sensitive defect using redacted or synthetic data.
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, `.env`, SQLite databases, OAuth codes/tokens,
+        access passwords, bearer tokens, or unredacted wellness data. Report a
+        vulnerability privately through the Security Policy instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Tagged version, container digest, or full commit SHA.
+      placeholder: v1.0.0 or 0123456789abcdef...
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - Docker Compose
+        - Docker / OCI image
+        - Node.js from source
+        - Railway
+        - Other self-hosted platform
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client and version
+      placeholder: Grok Build, Codex, Claude, Inspector, OpenClaw, or other
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include redacted status codes and errors, not secrets or personal data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction using synthetic or redacted data
+      description: Provide the smallest repeatable sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: Checks already attempted
+      placeholder: doctor output, health status, logs reviewed, relink attempted
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed secrets and personal wellness data.
+          required: true
+        - label: This is not a vulnerability report or medical question.
+          required: true

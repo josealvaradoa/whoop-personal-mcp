@@ -1,4 +1,13 @@
-# Project Audit — whoop-ironman-mcp
+# Historical self-review — pre-1.0 prototype
+
+> **Historical record, not an independent audit or certification:** This
+> self-review describes the earlier
+> `whoop-ironman-mcp` prototype and intentionally preserves findings that may no
+> longer match the current tree. The provider-neutral, single-user redesign is
+> documented in [README.md](../../README.md),
+> [CHANGELOG.md](../../CHANGELOG.md), [SECURITY.md](../../SECURITY.md), and
+> [PRIVACY.md](../../PRIVACY.md). Do not use this file
+> as current setup or security guidance.
 
 **Date:** 2026-07-02
 **Scope:** Every file in `src/` (20 files), infra (Dockerfile, CI, Railway config), docs (`README.md`, `agent/`), dependency and git-history review.

@@ -27,13 +27,43 @@ export function roundTo(value: number | null, decimals: number): number | null {
   return Math.round(value * factor) / factor;
 }
 
-// Whole calendar days from `b` to `a` (a − b), both YYYY-MM-DD in UTC. Positive
-// when `a` is the later day; 1 means `a` is the immediately-following calendar day.
+// Whole date-only calendar days from `b` to `a` (a − b). UTC arithmetic keeps the
+// result independent of the host timezone and daylight-saving transitions.
 export function dayDiff(a: string, b: string): number {
   const MS_PER_DAY = 24 * 60 * 60 * 1000;
   return Math.round(
     (Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / MS_PER_DAY,
   );
+}
+
+// Convert an instant to the configured owner's local calendar date. WHOOP
+// timestamps are absolute instants; slicing an ISO prefix misdates records near
+// midnight whenever the owner's timezone is not UTC.
+export function calendarDate(timestamp: string | Date, timeZone: string): string | null {
+  const instant = timestamp instanceof Date ? timestamp : new Date(timestamp);
+  if (!Number.isFinite(instant.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return values.year && values.month && values.day
+    ? `${values.year}-${values.month}-${values.day}`
+    : null;
+}
+
+export function calendarDaysSince(
+  asOfDate: string | null,
+  timeZone: string,
+  now = new Date(),
+): number | null {
+  if (asOfDate == null || !/^\d{4}-\d{2}-\d{2}$/.test(asOfDate)) return null;
+  const today = calendarDate(now, timeZone);
+  if (today == null) return null;
+  const difference = dayDiff(today, asOfDate);
+  return Number.isFinite(difference) ? difference : null;
 }
 
 // WHOOP reports energy in kilojoules; athletes think in kilocalories.
@@ -43,14 +73,14 @@ export function kjToKcal(kilojoule: number): number {
   return Math.round(kilojoule * KJ_TO_KCAL);
 }
 
-// --- Calendar-day bucketing (all day boundaries are evaluated in UTC) ---
+// --- Calendar-day bucketing (callers supply already-localized YYYY-MM-DD dates) ---
 
 export interface DayBucket<T> {
-  date: string; // YYYY-MM-DD (UTC)
+  date: string; // YYYY-MM-DD in the caller's selected calendar
   value: T;
 }
 
-// Reduce records to at most one per UTC calendar day, newest day first.
+// Reduce records to at most one caller-defined calendar day, newest day first.
 // Which record wins a shared day is decided solely by `order`: it sorts records
 // so the intended winner comes first. Cycles pass a real timestamp tiebreak
 // (latest `start` wins), so for them this is genuinely "latest-wins". Recovery and
@@ -75,7 +105,7 @@ export function dedupeByDay<T>(
   return out;
 }
 
-function shiftDay(day: string, delta: number): string {
+export function shiftCalendarDate(day: string, delta: number): string {
   const d = new Date(`${day}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + delta);
   return d.toISOString().split("T")[0];
@@ -91,7 +121,7 @@ export function windowByDays<E extends { date: string }>(
 ): E[] {
   if (entries.length === 0) return [];
   const anchor = entries[0].date;
-  const hi = shiftDay(anchor, -offset);
-  const lo = shiftDay(anchor, -(offset + n - 1));
+  const hi = shiftCalendarDate(anchor, -offset);
+  const lo = shiftCalendarDate(anchor, -(offset + n - 1));
   return entries.filter((e) => e.date >= lo && e.date <= hi);
 }

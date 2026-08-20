@@ -1,0 +1,101 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.josealvaradoa/whoop-personal-mcp",
+  "title": "WHOOP Personal MCP",
+  "description": "Single-user, self-hosted Streamable HTTP server for read-only WHOOP wellness data; native MCP 2026-07-28 with a stateless 2025-era fallback.",
+  "repository": {
+    "url": "https://github.com/josealvaradoa/whoop-personal-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/josealvaradoa/whoop-personal-mcp",
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "whoop-personal-mcp",
+      "version": "1.0.0",
+      "runtimeHint": "npx",
+      "environmentVariables": [
+        {
+          "name": "WHOOP_CLIENT_ID",
+          "description": "Client ID for your personal WHOOP Developer Platform app.",
+          "format": "string",
+          "isRequired": true
+        },
+        {
+          "name": "WHOOP_CLIENT_SECRET",
+          "description": "Client secret for your personal WHOOP Developer Platform app.",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "WHOOP_REDIRECT_URI",
+          "description": "Exact callback URI registered in WHOOP, normally http://localhost:3000/auth/whoop/callback for a local package run.",
+          "format": "string",
+          "isRequired": true
+        },
+        {
+          "name": "ENCRYPTION_SECRET",
+          "description": "At least 32 characters; derives the key that encrypts WHOOP tokens at rest.",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "ACCESS_PASSWORD",
+          "description": "At least 12 characters; confirms browser consent and WHOOP account linking.",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "MCP_BEARER_TOKEN",
+          "description": "Optional long-lived token for clients that use a static Authorization header.",
+          "format": "string",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PORT",
+          "description": "Local HTTP listening port.",
+          "format": "string",
+          "isRequired": false,
+          "value": "3000"
+        },
+        {
+          "name": "BIND_HOST",
+          "description": "Listening interface. Defaults to 127.0.0.1; set 0.0.0.0 only inside a protected container or remote host.",
+          "format": "string",
+          "isRequired": false,
+          "value": "127.0.0.1"
+        },
+        {
+          "name": "PUBLIC_URL",
+          "description": "Stable public origin used as the MCP OAuth issuer and canonical /mcp resource.",
+          "format": "string",
+          "isRequired": false,
+          "value": "http://localhost:3000"
+        },
+        {
+          "name": "ALLOWED_REDIRECT_HOSTS",
+          "description": "Optional comma-separated exact HTTPS callback hostnames trusted for remote CIMD or DCR clients; loopback is allowed automatically.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "DATA_DIR",
+          "description": "Directory containing the persistent SQLite database.",
+          "format": "string",
+          "isRequired": false,
+          "value": "./data"
+        }
+      ],
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:3000/mcp"
+      }
+    }
+  ]
+}

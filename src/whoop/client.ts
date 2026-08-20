@@ -1,10 +1,11 @@
-import { getValidAccessToken, forceRefreshAccessToken } from "./auth.js";
+import {
+  forceRefreshAccessToken,
+  getValidAccessToken,
+  WhoopAuthError,
+} from "./auth.js";
 import { config } from "../config.js";
-import * as cache from "../db/cache.js";
 import type {
   PaginatedResponse,
-  UserProfile,
-  BodyMeasurement,
   Cycle,
   Recovery,
   Sleep,
@@ -15,7 +16,29 @@ const BASE_URL = "https://api.prod.whoop.com/developer";
 
 // --- Private helpers ---
 
-const REQUEST_TIMEOUT_MS = 30_000;
+export type WhoopApiErrorCode =
+  | "AUTH_REQUIRED"
+  | "RATE_LIMITED"
+  | "UPSTREAM_TIMEOUT"
+  | "UPSTREAM_UNAVAILABLE"
+  | "UPSTREAM_INVALID_RESPONSE";
+
+export class WhoopApiError extends Error {
+  constructor(
+    readonly code: WhoopApiErrorCode,
+    message: string,
+    readonly retryable: boolean,
+    readonly status?: number,
+    readonly retryAfterSeconds?: number,
+  ) {
+    super(message);
+    this.name = "WhoopApiError";
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError");
+}
 
 async function fetchWhoop<T>(
   endpoint: string,
@@ -30,12 +53,12 @@ async function fetchWhoop<T>(
     }
   }
 
-  console.log(`[whoop-api] ${endpoint} ${params ? JSON.stringify(params) : ""}`);
   // The abort/timeout covers BOTH the header fetch and the body read: clearTimeout
   // only fires in the finally (after the body is consumed or throws), so a stalled
   // response body cannot hang a tool call indefinitely.
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), config.whoop.requestTimeoutMs);
+  timeoutId.unref();
   try {
     const response = await fetch(url.toString(), {
       headers: { Authorization: `Bearer ${accessToken}` },
@@ -43,9 +66,8 @@ async function fetchWhoop<T>(
     });
 
     if (!response.ok) {
-      const body = await response.text();
-
-      // On 401, FORCE a token refresh and retry once. A plain cache-invalidate is
+      // On 401, FORCE a token refresh and retry once. Invalidating only the
+      // in-memory token is
       // not enough: getValidAccessToken() reloads the same still-"valid" DB token
       // whenever it is outside the 300s expiry buffer, so a WHOOP-side early
       // revocation would never heal. forceRefreshAccessToken() bypasses that
@@ -56,20 +78,44 @@ async function fetchWhoop<T>(
         await forceRefreshAccessToken(); // surfaces a clear re-authorize error on definitive failure
         return await fetchWhoop<T>(endpoint, params, true);
       }
-
-      console.error(`[whoop-api] ${endpoint} → ${response.status}: ${body.slice(0, 200)}`);
-      throw new Error(`Whoop API error ${response.status} on ${endpoint}: ${body}`);
+      // Never record or surface upstream error bodies: they can contain identifiers.
+      if (response.status === 401 || response.status === 403) {
+        throw new WhoopApiError("AUTH_REQUIRED", "WHOOP authorization is invalid; re-link the account", false, response.status);
+      }
+      if (response.status === 429) {
+        const retryAfter = Number.parseInt(response.headers.get("retry-after") ?? "", 10);
+        throw new WhoopApiError(
+          "RATE_LIMITED",
+          "WHOOP rate limited the request",
+          true,
+          response.status,
+          Number.isFinite(retryAfter) ? retryAfter : undefined,
+        );
+      }
+      throw new WhoopApiError(
+        "UPSTREAM_UNAVAILABLE",
+        "WHOOP is temporarily unavailable",
+        response.status >= 500,
+        response.status,
+      );
     }
 
-    console.log(`[whoop-api] ${endpoint} → ${response.status}`);
     try {
       return (await response.json()) as T;
-    } catch (parseErr) {
+    } catch (parseError) {
       // 200 with an empty / non-JSON body (or a body read aborted by the timeout).
       // Log the detail server-side; surface a generic internal error to the caller.
-      console.error(`[whoop-api] ${endpoint} → 200 but body was unreadable:`, parseErr);
-      throw new Error(`Whoop API returned an unreadable response on ${endpoint}`);
+      if (isAbortError(parseError)) {
+        throw new WhoopApiError("UPSTREAM_TIMEOUT", "WHOOP response timed out", true);
+      }
+      throw new WhoopApiError("UPSTREAM_INVALID_RESPONSE", "WHOOP returned an unreadable response", true);
     }
+  } catch (error) {
+    if (error instanceof WhoopApiError || error instanceof WhoopAuthError) throw error;
+    if (isAbortError(error)) {
+      throw new WhoopApiError("UPSTREAM_TIMEOUT", "WHOOP request timed out", true);
+    }
+    throw new WhoopApiError("UPSTREAM_UNAVAILABLE", "WHOOP request failed", true);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -93,8 +139,8 @@ async function fetchAllPages<T>(
     // array. If it is not, log the shape server-side and surface a generic upstream
     // error rather than crashing with "records is not iterable" (never leak the body).
     if (!page || !Array.isArray(page.records)) {
-      console.error(`[whoop-api] ${endpoint} → 200 but 'records' was not an array (got ${typeof page?.records})`);
-      throw new Error(`Whoop API returned an unexpected response shape on ${endpoint}`);
+      console.error(`[whoop-api] ${endpoint} returned an invalid collection envelope`);
+      throw new WhoopApiError("UPSTREAM_INVALID_RESPONSE", "WHOOP returned an unexpected response shape", true);
     }
 
     allRecords.push(...page.records);
@@ -109,10 +155,6 @@ async function fetchAllPages<T>(
   }
 
   return allRecords;
-}
-
-function cacheTtlSeconds(): number {
-  return config.cache.ttl_minutes * 60;
 }
 
 // --- Date helpers ---
@@ -131,77 +173,27 @@ export function today(): string {
 
 // --- Public methods ---
 
-export async function getProfile(): Promise<UserProfile> {
-  const cacheKey = "profile";
-  const cached = cache.get(cacheKey);
-  if (cached) return cached as UserProfile;
-
-  const data = await fetchWhoop<UserProfile>("/v2/user/profile/basic");
-  cache.set(cacheKey, data, cacheTtlSeconds());
-  return data;
-}
-
-export async function getBodyMeasurements(): Promise<BodyMeasurement> {
-  const cacheKey = "body_measurement";
-  const cached = cache.get(cacheKey);
-  if (cached) return cached as BodyMeasurement;
-
-  const data = await fetchWhoop<BodyMeasurement>("/v2/user/measurement/body");
-  cache.set(cacheKey, data, cacheTtlSeconds());
-  return data;
-}
-
-// Normalize an ISO timestamp to YYYY-MM-DD for stable, reusable cache keys.
-// daysAgo()/today() embed milliseconds, so raw ISO strings would cause a cache miss on every call.
-function datePart(iso: string): string {
-  return iso.split("T")[0];
-}
-
 export async function getCycles(start: string, end: string): Promise<Cycle[]> {
-  const cacheKey = `cycles:${datePart(start)}:${datePart(end)}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return cached as Cycle[];
-
-  const data = await fetchAllPages<Cycle>("/v2/cycle", { start, end });
-  cache.set(cacheKey, data, cacheTtlSeconds());
-  return data;
+  return fetchAllPages<Cycle>("/v2/cycle", { start, end });
 }
 
 export async function getRecoveryCollection(
   start: string,
   end: string
 ): Promise<Recovery[]> {
-  const cacheKey = `recovery:${datePart(start)}:${datePart(end)}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return cached as Recovery[];
-
-  const data = await fetchAllPages<Recovery>("/v2/recovery", { start, end });
-  cache.set(cacheKey, data, cacheTtlSeconds());
-  return data;
+  return fetchAllPages<Recovery>("/v2/recovery", { start, end });
 }
 
 export async function getSleepCollection(
   start: string,
   end: string
 ): Promise<Sleep[]> {
-  const cacheKey = `sleep:${datePart(start)}:${datePart(end)}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return cached as Sleep[];
-
-  const data = await fetchAllPages<Sleep>("/v2/activity/sleep", { start, end });
-  cache.set(cacheKey, data, cacheTtlSeconds());
-  return data;
+  return fetchAllPages<Sleep>("/v2/activity/sleep", { start, end });
 }
 
 export async function getWorkoutCollection(
   start: string,
   end: string
 ): Promise<Workout[]> {
-  const cacheKey = `workout:${datePart(start)}:${datePart(end)}`;
-  const cached = cache.get(cacheKey);
-  if (cached) return cached as Workout[];
-
-  const data = await fetchAllPages<Workout>("/v2/activity/workout", { start, end });
-  cache.set(cacheKey, data, cacheTtlSeconds());
-  return data;
+  return fetchAllPages<Workout>("/v2/activity/workout", { start, end });
 }

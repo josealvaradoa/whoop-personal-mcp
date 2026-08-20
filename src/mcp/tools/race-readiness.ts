@@ -1,110 +1,180 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { daysAgo, today, getCycles, getRecoveryCollection, getSleepCollection, getWorkoutCollection } from "../../whoop/client.js";
-import { config } from "../../config.js";
-import { computeRecoveryTrend, toDailyRecovery } from "../../compute/recovery.js";
-import { computeHrvTrend } from "../../compute/hrv.js";
-import { mapSleepToDay, computeSleepTrend, isNightSleep } from "../../compute/sleep.js";
-import { computeTrainingLoad } from "../../compute/training-load.js";
 import {
-  getDaysToRace,
-  getCurrentPhase,
-  computeFitnessTrend,
-  computeFatigueStatus,
-  computeKeyConcerns,
-  buildWeeklySummary,
-  weeklyWorkoutVolumeHrs,
+  daysAgo,
+  today,
+  getCycles,
+  getRecoveryCollection,
+  getSleepCollection,
+} from "../../whoop/client.js";
+import { config } from "../../config.js";
+import {
+  computeRecoveryTrend,
+  cycleDateMap,
+  toDailyRecovery,
+} from "../../compute/recovery.js";
+import { computeHrvTrend } from "../../compute/hrv.js";
+import {
+  mapSleepToDay,
+  computeSleepTrend,
+  isNightSleep,
+  isSleepDayData,
+} from "../../compute/sleep.js";
+import { calendarDaysSince } from "../../compute/stats.js";
+import {
+  getDaysToEvent,
+  getCurrentEventPhase,
+  computeRecoveryContextStatus,
+  computeEventContextAssessmentStatus,
+  computeKeyObservations,
+  buildEventContextSummary,
 } from "../../compute/race-readiness.js";
-import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
+import {
+  defineTool,
+  READ_ONLY_ANNOTATIONS,
+  CYCLE_DATING_BUFFER_DAYS,
+} from "./helpers.js";
 
-export function registerRaceReadinessTool(server: McpServer): void {
+export function registerEventContextTool(server: McpServer): void {
   defineTool(
     server,
-    "whoop_get_race_readiness",
+    "whoop_get_event_context",
     {
-      title: "Race Readiness Assessment",
+      title: "Event Preparation Wellness Context",
       description:
-        "Get a comprehensive race readiness assessment: days to race, current training phase, fitness trend, fatigue status, key concerns, and a weekly summary. Uses the configured race date and periodization phases. fitness_trend and fatigue_status are null when there is not enough recent scored data to assess them (null never means zero).",
+        "Summarize recent WHOOP Recovery, HRV, and sleep observations alongside an explicitly configured event. This is not a readiness score, physiological-fatigue assessment, injury prediction, medical assessment, training prescription, or event clearance. assessment_status is context_available only when minimum data coverage is met and every input is at most two days old; otherwise the tool explicitly abstains. A fresh consecutive-red-band observation may remain visible when other coverage is insufficient, but stale or future-dated observations are withheld. Experimental Day Strain ratios are never used.",
       inputSchema: {},
       outputSchema: {
         computed: z.object({
-          days_to_race: z.number(),
-          race_name: z.string(),
-          race_date: z.string(),
-          current_phase: z.string(),
-          fitness_trend: z.enum(["on_track", "undertrained", "overreaching", "injury_risk"]).nullable(),
-          fatigue_status: z.enum(["fresh", "manageable", "accumulating", "critical"]).nullable(),
-          key_concerns: z.array(z.string()),
+          days_to_event: z.number().nullable(),
+          event_name: z.string().nullable(),
+          event_date: z.string().nullable(),
+          current_phase: z.string().nullable(),
+          assessment_status: z.enum([
+            "context_available",
+            "event_not_configured",
+            "insufficient_data",
+            "stale_data",
+          ]),
+          assessment_available: z.boolean(),
+          is_clearance: z.literal(false),
+          recovery_context_status: z
+            .enum([
+              "above_longer_average",
+              "similar_to_longer_average",
+              "below_longer_average",
+              "red_band_streak_alert",
+            ])
+            .nullable(),
+          red_streak_alert: z.boolean(),
+          key_observations: z.array(
+            z.enum([
+              "red_band_streak_observed",
+              "recovery_below_longer_average",
+              "whoop_sleep_debt_present",
+              "sleep_below_configured_target",
+              "declining_recovery_trend",
+              "declining_hrv_trend",
+            ]),
+          ),
           weekly_summary: z.string(),
+          data_quality: z.object({
+            recovery_days_7d: z.number(),
+            recovery_days_30d: z.number(),
+            hrv_days_7d: z.number(),
+            hrv_days_30d: z.number(),
+            sleep_nights_7d: z.number(),
+            recovery_age_days: z.number().nullable(),
+            hrv_age_days: z.number().nullable(),
+            sleep_age_days: z.number().nullable(),
+          }),
         }),
       },
       annotations: READ_ONLY_ANNOTATIONS,
-      errorLabel: "fetching race readiness",
+      errorLabel: "fetching event-preparation wellness context",
     },
     async () => {
-      const start42d = daysAgo(42);
-      const start30d = daysAgo(30);
-      const start14d = daysAgo(14);
       const end = today();
-
-      const [cycles, recoveries, sleeps, workouts] = await Promise.all([
-        getCycles(start42d, end),
-        getRecoveryCollection(start30d, end),
-        getSleepCollection(start14d, end),
-        getWorkoutCollection(daysAgo(7), end),
+      const [cycles, recoveries, sleeps] = await Promise.all([
+        getCycles(daysAgo(30 + CYCLE_DATING_BUFFER_DAYS), end),
+        getRecoveryCollection(daysAgo(30), end),
+        getSleepCollection(daysAgo(14), end),
       ]);
 
-      const cycleDates = new Map(cycles.map((c) => [c.id, c.start.split("T")[0]]));
+      const cycleDates = cycleDateMap(cycles, config.athlete.timezone);
       const dailyRecovery = toDailyRecovery(recoveries, cycleDates);
-
-      // Training load
-      const trainingLoad = computeTrainingLoad(cycles);
-
-      // Recovery + HRV
       const recoveryResult = computeRecoveryTrend(dailyRecovery);
       const hrvResult = computeHrvTrend(dailyRecovery);
+      const sleepResult = computeSleepTrend(
+        sleeps
+          .filter(isNightSleep)
+          .map((sleep) => mapSleepToDay(sleep, config.athlete.timezone))
+          .filter(isSleepDayData),
+      );
 
-      // Sleep
-      const sleepDays = sleeps.filter(isNightSleep).map(mapSleepToDay);
-      const sleepResult = computeSleepTrend(sleepDays);
-
-      // Weekly volume — SCORED workouts only (see weeklyWorkoutVolumeHrs).
-      const weeklyVolumeHrs = weeklyWorkoutVolumeHrs(workouts);
-
-      const currentPhase = getCurrentPhase();
-      const fitnessTrend = computeFitnessTrend(trainingLoad.acwr_zone, recoveryResult.trend);
-      const fatigueStatus = computeFatigueStatus(
+      const recoveryAgeDays = calendarDaysSince(
+        recoveryResult.as_of_date,
+        config.athlete.timezone,
+      );
+      const hrvAgeDays = calendarDaysSince(hrvResult.as_of_date, config.athlete.timezone);
+      const sleepAgeDays = calendarDaysSince(sleepResult.as_of_date, config.athlete.timezone);
+      const recoveryContextStatus = computeRecoveryContextStatus(
         recoveryResult.avg_7d,
         recoveryResult.avg_30d,
-        recoveryResult.consecutive_red_days
+        recoveryResult.consecutive_red_days,
+        recoveryResult.days_with_data_7d,
+        recoveryResult.days_with_data_30d,
+        recoveryAgeDays,
       );
-      const concerns = computeKeyConcerns({
-        sleepDebtHrs: sleepResult.sleep_debt_cumulative_hrs,
-        monotony: trainingLoad.monotony,
-        acwr: trainingLoad.acwr,
+      const assessmentStatus = computeEventContextAssessmentStatus({
+        eventConfigured: config.event != null,
+        recoveryDays7d: recoveryResult.days_with_data_7d,
+        recoveryDays30d: recoveryResult.days_with_data_30d,
+        hrvDays7d: hrvResult.days_with_data_7d,
+        hrvDays30d: hrvResult.days_with_data_30d,
+        sleepNights7d: sleepResult.nights_with_data_7d,
+        recoveryAgeDays,
+        hrvAgeDays,
+        sleepAgeDays,
+      });
+      const observations = computeKeyObservations({
+        assessmentStatus,
+        recoveryContextStatus,
+        whoopSleepDebtHrs: sleepResult.latest_whoop_sleep_debt_hrs,
+        sleepDurationBalanceHrs: sleepResult.sleep_duration_balance_7d_hrs,
         recoveryTrend: recoveryResult.trend,
         hrvTrend: hrvResult.trend,
-        weeklyVolumeHrs,
-        currentPhase,
       });
-      const weeklySummary = buildWeeklySummary({
+      const weeklySummary = buildEventContextSummary({
+        assessmentStatus,
         recoveryTrend: recoveryResult.trend,
-        acwrZone: trainingLoad.acwr_zone,
-        acwr: trainingLoad.acwr,
-        concerns,
-        fatigueStatus,
+        recoveryContextStatus,
+        observations,
       });
 
       return {
         computed: {
-          days_to_race: getDaysToRace(),
-          race_name: config.race.name,
-          race_date: config.race.date,
-          current_phase: currentPhase,
-          fitness_trend: fitnessTrend,
-          fatigue_status: fatigueStatus,
-          key_concerns: concerns,
+          days_to_event: getDaysToEvent(),
+          event_name: config.event?.name ?? null,
+          event_date: config.event?.date ?? null,
+          current_phase: getCurrentEventPhase(),
+          assessment_status: assessmentStatus,
+          assessment_available: assessmentStatus === "context_available",
+          is_clearance: false as const,
+          recovery_context_status: recoveryContextStatus,
+          red_streak_alert: recoveryContextStatus === "red_band_streak_alert",
+          key_observations: observations,
           weekly_summary: weeklySummary,
+          data_quality: {
+            recovery_days_7d: recoveryResult.days_with_data_7d,
+            recovery_days_30d: recoveryResult.days_with_data_30d,
+            hrv_days_7d: hrvResult.days_with_data_7d,
+            hrv_days_30d: hrvResult.days_with_data_30d,
+            sleep_nights_7d: sleepResult.nights_with_data_7d,
+            recovery_age_days: recoveryAgeDays,
+            hrv_age_days: hrvAgeDays,
+            sleep_age_days: sleepAgeDays,
+          },
         },
       };
     },

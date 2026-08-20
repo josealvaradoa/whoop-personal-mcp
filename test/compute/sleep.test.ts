@@ -23,23 +23,25 @@ describe("isNightSleep (naps and unscored records excluded)", () => {
 
 describe("mapSleepToDay", () => {
   it("derives duration from light+SWS+REM and passes through the score fields", () => {
-    const night = [
-      makeSleep({
-        date: D,
-        lightHrs: 3,
-        slowWaveHrs: 1.5,
-        remHrs: 1.5,
-        awakeHrs: 0.5,
-        efficiencyPct: 92,
-        performancePct: 90,
-        respiratoryRate: 15,
-      }),
-    ]
-      .filter(isNightSleep)
-      .map(mapSleepToDay)[0];
+    const source = makeSleep({
+      date: D,
+      lightHrs: 3,
+      slowWaveHrs: 1.5,
+      remHrs: 1.5,
+      awakeHrs: 0.5,
+      efficiencyPct: 92,
+      performancePct: 90,
+      respiratoryRate: 15,
+    });
+    if (!isNightSleep(source)) throw new Error("fixture should be scored nightly sleep");
+    const night = mapSleepToDay(source, "UTC");
+    if (night == null) throw new Error("valid fixture should map to a sleep day");
 
     expect(night.date).toBe(D);
     expect(night.duration_hrs).toBe(6); // 3 + 1.5 + 1.5 (awake excluded)
+    expect(night.sleep_need_hrs).toBe(8);
+    expect(night.whoop_sleep_debt_hrs).toBe(0);
+    expect(night.consistency_pct).toBe(80);
     expect(night.efficiency_pct).toBe(92);
     expect(night.performance_pct).toBe(90);
     expect(night.respiratory_rate).toBe(15);
@@ -59,8 +61,36 @@ describe("mapSleepToDay", () => {
       start: `${shiftDay(D, -1)}T22:30:00.000Z`,
       end: `${D}T06:15:00.000Z`,
     };
-    const mapped = [crossMidnight].filter(isNightSleep).map(mapSleepToDay)[0];
+    if (!isNightSleep(crossMidnight)) throw new Error("fixture should be nightly sleep");
+    const mapped = mapSleepToDay(crossMidnight, "UTC");
+    if (mapped == null) throw new Error("valid fixture should map to a sleep day");
     expect(mapped.date).toBe(D); // wake day, not the start day (D-1)
+  });
+
+  it("uses the configured owner timezone for wake-day dating", () => {
+    const source = {
+      ...makeSleep({ date: D }),
+      end: `${D}T01:00:00.000Z`,
+    };
+    if (!isNightSleep(source)) throw new Error("fixture should be nightly sleep");
+    expect(mapSleepToDay(source, "America/New_York")?.date).toBe(shiftDay(D, -1));
+  });
+
+  it("drops non-finite stages and normalizes dirty nullable score metrics", () => {
+    const badStage = makeSleep({ date: D });
+    if (!isNightSleep(badStage)) throw new Error("fixture should be nightly sleep");
+    badStage.score.stage_summary.total_rem_sleep_time_milli = Number.NaN;
+    expect(mapSleepToDay(badStage, "UTC")).toBeNull();
+
+    const dirtyOptional = makeSleep({ date: D });
+    if (!isNightSleep(dirtyOptional)) throw new Error("fixture should be nightly sleep");
+    dirtyOptional.score.sleep_efficiency_percentage = Number.NaN;
+    dirtyOptional.score.sleep_consistency_percentage = 120;
+    dirtyOptional.score.respiratory_rate = Number.NaN;
+    const mapped = mapSleepToDay(dirtyOptional, "UTC");
+    expect(mapped?.efficiency_pct).toBeNull();
+    expect(mapped?.consistency_pct).toBeNull();
+    expect(mapped?.respiratory_rate).toBeNull();
   });
 });
 
@@ -68,40 +98,68 @@ describe("computeSleepTrend", () => {
   it("empty input → null metrics (never zero)", () => {
     expect(computeSleepTrend([])).toEqual({
       avg_duration_7d_hrs: null,
+      avg_sleep_need_7d_hrs: null,
       avg_efficiency_7d_pct: null,
-      sleep_debt_cumulative_hrs: null,
-      consistency_score: null,
-      trend: null,
+      avg_consistency_7d_pct: null,
+      configured_sleep_target_hrs: 8,
+      sleep_duration_balance_7d_hrs: null,
+      latest_whoop_sleep_debt_hrs: null,
+      nights_with_data_7d: 0,
+      duration_direction: null,
       as_of_date: null,
     });
   });
 
-  it("sleep debt is negative (a deficit) when nightly duration is below target", () => {
+  it("reports a negative signed duration balance when sleep is below the configured target", () => {
     const days = consecutiveSleepDays(D, Array(7).fill(6)); // target is 8h
-    const r = computeSleepTrend(days);
+    const r = computeSleepTrend(days, 8);
     expect(r.avg_duration_7d_hrs).toBe(6);
-    expect(r.sleep_debt_cumulative_hrs).toBe(-14); // 7 * (6 - 8)
+    expect(r.sleep_duration_balance_7d_hrs).toBe(-14); // 7 * (6 - 8)
     expect(r.avg_efficiency_7d_pct).toBe(90);
-    expect(r.consistency_score).toBe(1); // identical durations → perfectly consistent
-    expect(r.trend).toBeNull(); // no previous window
+    expect(r.avg_consistency_7d_pct).toBeNull(); // never invent consistency from duration SD
+    expect(r.latest_whoop_sleep_debt_hrs).toBeNull();
+    expect(r.duration_direction).toBeNull(); // no previous window
   });
 
-  it("sleep debt is positive (a surplus) when nightly duration exceeds target", () => {
-    const r = computeSleepTrend(consecutiveSleepDays(D, Array(7).fill(9)));
-    expect(r.sleep_debt_cumulative_hrs).toBe(7); // 7 * (9 - 8)
+  it("reports a positive signed duration balance when sleep exceeds the target", () => {
+    const r = computeSleepTrend(consecutiveSleepDays(D, Array(7).fill(9)), 8);
+    expect(r.sleep_duration_balance_7d_hrs).toBe(7); // 7 * (9 - 8)
   });
 
-  it("consistency score drops below 1 as durations vary", () => {
-    const r = computeSleepTrend(consecutiveSleepDays(D, [8, 6])); // mean 7, stddev 1
-    expect(r.avg_duration_7d_hrs).toBe(7);
-    expect(r.consistency_score).toBe(0.86); // round(1 - 1/7, 2)
+  it("averages WHOOP's native consistency and Sleep Need fields", () => {
+    const days = [
+      makeSleepDay({
+        date: D,
+        durationHrs: 8,
+        sleepNeedHrs: 9,
+        whoopSleepDebtHrs: 1.5,
+        consistencyPct: 80,
+      }),
+      makeSleepDay({
+        date: shiftDay(D, -1),
+        durationHrs: 7,
+        sleepNeedHrs: 8,
+        whoopSleepDebtHrs: 1,
+        consistencyPct: 90,
+      }),
+    ];
+    const r = computeSleepTrend(days);
+    expect(r.avg_sleep_need_7d_hrs).toBe(8.5);
+    expect(r.avg_consistency_7d_pct).toBe(85);
+    expect(r.latest_whoop_sleep_debt_hrs).toBe(1.5);
   });
 
-  it("single night → consistency null (stddev undefined) but debt is a real 0", () => {
-    const r = computeSleepTrend(consecutiveSleepDays(D, [8]));
+  it("single night keeps native consistency unavailable and balance at a real zero", () => {
+    const r = computeSleepTrend(consecutiveSleepDays(D, [8]), 8);
     expect(r.avg_duration_7d_hrs).toBe(8);
-    expect(r.consistency_score).toBeNull();
-    expect(r.sleep_debt_cumulative_hrs).toBe(0);
+    expect(r.avg_consistency_7d_pct).toBeNull();
+    expect(r.sleep_duration_balance_7d_hrs).toBe(0);
+  });
+
+  it("does not invent a target balance when no sleep target is configured", () => {
+    const result = computeSleepTrend(consecutiveSleepDays(D, [8]), null);
+    expect(result.configured_sleep_target_hrs).toBeNull();
+    expect(result.sleep_duration_balance_7d_hrs).toBeNull();
   });
 
   it("averages only non-null efficiencies", () => {
@@ -113,9 +171,9 @@ describe("computeSleepTrend", () => {
     expect(computeSleepTrend(days).avg_efficiency_7d_pct).toBe(85); // mean(90, 80)
   });
 
-  it("detects an improving duration trend vs the previous week", () => {
+  it("neutrally reports a longer duration window vs the previous week", () => {
     const days = consecutiveSleepDays(D, [...Array(7).fill(9), ...Array(7).fill(6)]);
-    expect(computeSleepTrend(days).trend).toBe("improving");
+    expect(computeSleepTrend(days).duration_direction).toBe("longer");
   });
 
   it("reports as_of_date as the newest sleep day (fix 4)", () => {

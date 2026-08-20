@@ -4,21 +4,6 @@ export interface PaginatedResponse<T> {
   next_token: string | null;
 }
 
-// User profile
-export interface UserProfile {
-  user_id: number;
-  first_name: string;
-  last_name: string;
-  email: string;
-}
-
-// Body measurements
-export interface BodyMeasurement {
-  height_meter: number;
-  weight_kilogram: number;
-  max_heart_rate: number;
-}
-
 // Physiological cycle
 export interface Cycle {
   id: number;

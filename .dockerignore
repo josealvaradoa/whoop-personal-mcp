@@ -3,6 +3,12 @@ dist/
 .git/
 data/
 .env
-*.md
+.env.*
+!.env.example
+whoop-mcp.config.json
+.pnpm-store/
+coverage/
+*.log
+*.tgz
 .claude/
 test-curls.sh

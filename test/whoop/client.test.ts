@@ -1,18 +1,26 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import {
   MockAgent,
   setGlobalDispatcher,
   getGlobalDispatcher,
   type Dispatcher,
 } from "undici";
-import { useIsolatedDataDir, initTestDb, clearCache } from "../helpers/db.js";
+import { useIsolatedDataDir, initTestDb } from "../helpers/db.js";
 
 // Isolate DATA_DIR before any getDb() call (getDb reads DATA_DIR lazily).
 useIsolatedDataDir("client");
 
-import { storeTokens, invalidateTokenCache, getTokens } from "../../src/whoop/auth.js";
-import { getProfile, getCycles } from "../../src/whoop/client.js";
+import {
+  exchangeCodeForTokens,
+  forceRefreshAccessToken,
+  getTokens,
+  invalidateTokenCache,
+  storeTokens,
+} from "../../src/whoop/auth.js";
+import { getCycles } from "../../src/whoop/client.js";
 import { makeCycle } from "../helpers/fixtures.js";
+import { config } from "../../src/config.js";
+import { getDb } from "../../src/db/connection.js";
 
 const WHOOP_ORIGIN = "https://api.prod.whoop.com";
 const SCOPE = "read:recovery read:cycles read:sleep read:workout offline";
@@ -20,7 +28,7 @@ const SCOPE = "read:recovery read:cycles read:sleep read:workout offline";
 // --- undici mock plumbing (self-contained; does not touch shared whoopMock helper) ---
 
 let originalDispatcher: Dispatcher | null = null;
-let agent: MockAgent;
+let agent: MockAgent | undefined;
 
 function installMock(): MockAgent {
   if (originalDispatcher === null) originalDispatcher = getGlobalDispatcher();
@@ -60,15 +68,63 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  clearCache(); // response cache is date-keyed; must not leak between tests
   invalidateTokenCache(); // reset the in-memory WHOOP token cache
   // Default: a valid, far-from-expiry token so getValidAccessToken() never refreshes.
   storeTokens("valid-access-token", "valid-refresh-token", 3600, SCOPE);
 });
 
 afterEach(async () => {
-  await agent.close();
+  if (agent) await agent.close();
+  agent = undefined;
   if (originalDispatcher) setGlobalDispatcher(originalDispatcher);
+});
+
+function abortableFetchSpy() {
+  return vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      const abort = () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      };
+      if (init?.signal?.aborted) abort();
+      else init?.signal?.addEventListener("abort", abort, { once: true });
+    }),
+  );
+}
+
+describe("WHOOP OAuth requests are time-bounded", () => {
+  it("times out a hung refresh without deleting retryable credentials", async () => {
+    const spy = abortableFetchSpy();
+    vi.useFakeTimers();
+    try {
+      const refresh = forceRefreshAccessToken();
+      const rejected = expect(refresh).rejects.toMatchObject({ code: "UPSTREAM_TIMEOUT", retryable: true });
+      await vi.advanceTimersByTimeAsync(config.whoop.requestTimeoutMs + 1);
+      await rejected;
+      expect(getTokens()).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+    }
+  });
+
+  it("times out a hung authorization-code exchange", async () => {
+    getDb().prepare("DELETE FROM tokens").run();
+    invalidateTokenCache();
+    const spy = abortableFetchSpy();
+    vi.useFakeTimers();
+    try {
+      const exchange = exchangeCodeForTokens("test-code");
+      const rejected = expect(exchange).rejects.toMatchObject({ code: "UPSTREAM_TIMEOUT", retryable: true });
+      await vi.advanceTimersByTimeAsync(config.whoop.requestTimeoutMs + 1);
+      await rejected;
+      expect(getTokens()).toBeNull();
+    } finally {
+      vi.useRealTimers();
+      spy.mockRestore();
+    }
+  });
 });
 
 describe("WHOOP client — 401 forces a real token refresh and retries with the NEW token", () => {
@@ -84,14 +140,14 @@ describe("WHOOP client — 401 forces a real token refresh and retries with the 
 
     // Data endpoint: 401 for the OLD bearer, 200 once the NEW bearer arrives.
     pool
-      .intercept({ path: atPrefix("/developer/v2/user/profile/basic"), method: "GET" })
+      .intercept({ path: atPrefix("/developer/v2/cycle"), method: "GET" })
       .reply((opts) => {
         const bearer = readHeader(opts.headers, "authorization");
         seenBearers.push(bearer);
         if (bearer === `Bearer ${NEW}`) {
           return {
             statusCode: 200,
-            data: { user_id: 1, first_name: "Jo", last_name: "A", email: "x@y.z" },
+            data: { records: [makeCycle({ date: "2026-06-10", id: 1 })], next_token: null },
             responseOptions: jsonHeaders,
           };
         }
@@ -119,9 +175,9 @@ describe("WHOOP client — 401 forces a real token refresh and retries with the 
       })
       .persist();
 
-    const profile = await getProfile();
+    const cycles = await getCycles("2026-06-01T00:00:00Z", "2026-06-15T00:00:00Z");
 
-    expect(profile.user_id).toBe(1);
+    expect(cycles[0].id).toBe(1);
     // Exactly one refresh, exactly two data attempts: OLD (401) then NEW (200).
     expect(refreshCalls).toBe(1);
     expect(seenBearers).toEqual([`Bearer ${OLD}`, `Bearer ${NEW}`]);
@@ -135,7 +191,7 @@ describe("WHOOP client — 401 forces a real token refresh and retries with the 
 
     const pool = installMock().get(WHOOP_ORIGIN);
     pool
-      .intercept({ path: atPrefix("/developer/v2/user/profile/basic"), method: "GET" })
+      .intercept({ path: atPrefix("/developer/v2/cycle"), method: "GET" })
       .reply(401, "unauthorized")
       .persist();
     pool
@@ -143,7 +199,7 @@ describe("WHOOP client — 401 forces a real token refresh and retries with the 
       .reply(400, { error: "invalid_grant" }, jsonHeaders)
       .persist();
 
-    await expect(getProfile()).rejects.toThrow(/re-authorize/i);
+    await expect(getCycles("2026-07-01T00:00:00Z", "2026-07-15T00:00:00Z")).rejects.toThrow(/re-link/i);
   });
 });
 
@@ -164,11 +220,11 @@ describe("WHOOP client — malformed 200 body does not crash the tool", () => {
   it("a 200 body that is not valid JSON throws a generic 'unreadable response' error", async () => {
     const pool = installMock().get(WHOOP_ORIGIN);
     pool
-      .intercept({ path: atPrefix("/developer/v2/user/profile/basic"), method: "GET" })
+      .intercept({ path: atPrefix("/developer/v2/cycle"), method: "GET" })
       .reply(200, "<html>not json</html>", { headers: { "content-type": "application/json" } })
       .persist();
 
-    await expect(getProfile()).rejects.toThrow(/unreadable response/i);
+    await expect(getCycles("2026-08-01T00:00:00Z", "2026-08-15T00:00:00Z")).rejects.toThrow(/unreadable response/i);
   });
 });
 

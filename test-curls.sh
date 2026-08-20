@@ -1,71 +1,105 @@
-#!/bin/bash
-# MCP Server test commands (dev helper)
-# Usage: Run each section separately, replacing SESSION_ID where needed.
-#
-# BEARER must be the value of your MCP_BEARER_TOKEN env var. This static-bearer
-# path only works when MCP_BEARER_TOKEN is set on the server; if it is unset,
-# there is no static auth and you must use the OAuth flow (see README / agent/SETUP.md).
-# Link your WHOOP account first by opening $BASE/auth/whoop and entering ACCESS_PASSWORD.
-BEARER="your-mcp-bearer-token"
-BASE="http://localhost:3000"
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 1. Health check
-echo "=== Health Check ==="
-curl -s "$BASE/health"
-echo -e "\n"
+# Transport smoke test for a running WHOOP Personal MCP server.
+# Required: MCP_BEARER_TOKEN must match the server's configured static token.
+# Optional: BASE_URL (default http://localhost:3000), SMOKE_CALL_WHOOP=1.
 
-# 2. Auth status
-echo "=== Auth Status ==="
-curl -s "$BASE/auth/status"
-echo -e "\n"
+BASE_URL="${BASE_URL:-http://localhost:3000}"
+TOKEN="${MCP_BEARER_TOKEN:-}"
 
-# 3. Initialize MCP session (note the session ID in response headers)
-echo "=== Initialize MCP Session ==="
-curl -s -D - -X POST "$BASE/mcp" \
-  -H "Authorization: Bearer $BEARER" \
+if [[ -z "$TOKEN" ]]; then
+  echo "MCP_BEARER_TOKEN is required for this static-auth smoke test." >&2
+  exit 2
+fi
+
+HEADERS_FILE="$(mktemp)"
+BODY_FILE="$(mktemp)"
+cleanup() {
+  rm -f "$HEADERS_FILE" "$BODY_FILE"
+}
+trap cleanup EXIT
+
+echo "1/6 health"
+curl --fail --silent --show-error "$BASE_URL/health"
+echo
+
+echo "2/6 WHOOP link status"
+curl --fail --silent --show-error \
+  -H "Authorization: Bearer $TOKEN" \
+  "$BASE_URL/auth/status"
+echo
+
+echo "3/6 discover MCP 2026-07-28 server"
+curl --fail --silent --show-error \
+  --dump-header "$HEADERS_FILE" \
+  --output "$BODY_FILE" \
+  --request POST "$BASE_URL/mcp" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
-echo -e "\n"
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  --data '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl-smoke","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+cat "$BODY_FILE"
+echo
 
-# 4. List tools (replace SESSION_ID with the mcp-session-id from step 3)
-echo "=== List Tools ==="
-echo "Replace SESSION_ID below with the value from step 3"
-# curl -s -X POST "$BASE/mcp" \
-#   -H "Authorization: Bearer $BEARER" \
-#   -H "Content-Type: application/json" \
-#   -H "Accept: application/json, text/event-stream" \
-#   -H "Mcp-Session-Id: SESSION_ID" \
-#   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+if grep -qi '^mcp-session-id:' "$HEADERS_FILE"; then
+  echo "Modern response unexpectedly included the removed Mcp-Session-Id header." >&2
+  exit 1
+fi
+if ! grep -q '2026-07-28' "$BODY_FILE"; then
+  echo "Discovery response did not advertise MCP 2026-07-28." >&2
+  exit 1
+fi
 
-# 5. Call a tool (replace SESSION_ID)
-echo "=== Call whoop_get_today_overview ==="
-echo "Replace SESSION_ID below with the value from step 3"
-# curl -s -X POST "$BASE/mcp" \
-#   -H "Authorization: Bearer $BEARER" \
-#   -H "Content-Type: application/json" \
-#   -H "Accept: application/json, text/event-stream" \
-#   -H "Mcp-Session-Id: SESSION_ID" \
-#   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoop_get_today_overview","arguments":{}}}'
-
-# 6. Test rejection — no session ID on non-initialize request
-echo "=== Test No Session (should 400) ==="
-curl -s -X POST "$BASE/mcp" \
-  -H "Authorization: Bearer $BEARER" \
+echo "4/6 list tools without a transport session"
+curl --fail --silent --show-error \
+  --request POST "$BASE_URL/mcp" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}'
-echo -e "\n"
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl-smoke","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+echo
 
-# 7. Test rejection — no bearer token (should 401)
-echo "=== Test No Auth (should 401) ==="
-curl -s -X POST "$BASE/mcp" \
+if [[ "${SMOKE_CALL_WHOOP:-0}" == "1" ]]; then
+  echo "optional WHOOP tool call"
+  curl --fail --silent --show-error \
+    --request POST "$BASE_URL/mcp" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "MCP-Protocol-Version: 2026-07-28" \
+    -H "Mcp-Method: tools/call" \
+    -H "Mcp-Name: whoop_get_today_overview" \
+    --data '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"whoop_get_today_overview","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"curl-smoke","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+  echo
+fi
+
+echo "5/6 reject missing authentication"
+STATUS="$(
+  curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+    --request POST "$BASE_URL/mcp" \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json, text/event-stream" \
+    -H "MCP-Protocol-Version: 2026-07-28" \
+    -H "Mcp-Method: server/discover" \
+    --data '{"jsonrpc":"2.0","id":4,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"unauthorized-smoke","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}}}'
+)"
+if [[ "$STATUS" != "401" ]]; then
+  echo "Expected unauthenticated discovery to return 401; got $STATUS." >&2
+  exit 1
+fi
+
+echo "6/6 verify legacy 2025 client fallback"
+curl --fail --silent --show-error \
+  --request POST "$BASE_URL/mcp" \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
-echo -e "\n"
-
-# 8. Close session (replace SESSION_ID)
-echo "=== Close Session ==="
-echo "Replace SESSION_ID below with the value from step 3"
-# curl -s -X DELETE "$BASE/mcp" \
-#   -H "Authorization: Bearer $BEARER" \
-#   -H "Mcp-Session-Id: SESSION_ID"
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  --data '{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"legacy-curl-smoke","version":"1.0"}}}'
+echo
+echo "HTTP smoke test passed."

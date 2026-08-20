@@ -19,8 +19,8 @@ let originalDispatcher: Dispatcher | null = null;
 /**
  * Install a MockAgent that answers every WHOOP collection endpoint with the given
  * fixtures (defaults to empty collections → exercises the missing-data path).
- * Interceptors are `.persist()`ed so the same endpoint can be hit across pages,
- * cache keys, and repeated tool calls.
+ * Interceptors are `.persist()`ed so the same endpoint can be hit across pages
+ * and repeated tool calls.
  */
 export function installWhoopMock(data: WhoopData = {}): MockAgent {
   if (originalDispatcher === null) originalDispatcher = getGlobalDispatcher();

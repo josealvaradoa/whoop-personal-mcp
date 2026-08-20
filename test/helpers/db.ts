@@ -37,8 +37,3 @@ export function seedWhoopTokens(): void {
     "read:recovery read:cycles read:sleep read:workout offline",
   );
 }
-
-/** Clear the response cache so date-keyed cache entries don't leak between tests. */
-export function clearCache(): void {
-  getDb().exec("DELETE FROM cache");
-}
