@@ -61,7 +61,7 @@ jobs:
       - if: matrix.node-version == 22
         run: pnpm run smoke:package
       - if: matrix.node-version == 22
-        run: pnpm audit --prod --audit-level high
+        run: pnpm audit --audit-level high
 
   container:
     name: Container build and smoke
