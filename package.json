@@ -1,39 +1,93 @@
 {
-  "name": "whoop-ironman-mcp",
+  "name": "whoop-personal-mcp",
   "version": "1.0.0",
-  "description": "Remote MCP server connecting Whoop fitness data to Claude for Ironman 70.3 training coaching",
+  "description": "Single-user, self-hosted MCP server for read-only WHOOP wellness and training data",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "whoop-personal-mcp": "bin/whoop-personal-mcp.js"
+  },
+  "files": [
+    "dist/",
+    "bin/",
+    "docs/",
+    "scripts/",
+    "templates/",
+    "examples/",
+    ".env.example",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "DISCLAIMER.md",
+    "GOVERNANCE.md",
+    "LICENSE",
+    "MAINTAINERS.md",
+    "PRIVACY.md",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "test-curls.sh",
+    "server.json",
+    "whoop-mcp.config.example.json"
+  ],
   "scripts": {
     "dev": "node --import tsx src/index.ts",
-    "build": "tsc",
+    "clean": "node scripts/clean.mjs",
+    "build": "npm run clean && tsc",
     "start": "node dist/index.js",
     "lint": "eslint src/",
+    "lint:docs": "node scripts/check-doc-links.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepack": "npm run build && node scripts/verify-package.mjs",
+    "smoke:http": "bash ./test-curls.sh",
+    "smoke:cli": "node scripts/smoke-cli.mjs",
+    "smoke:package": "npm run build && npm run lint:docs && npm run smoke:cli && node scripts/verify-package.mjs && node scripts/verify-tarball.mjs"
   },
   "keywords": [
     "mcp",
     "whoop",
-    "ironman",
-    "triathlon",
+    "model-context-protocol",
+    "self-hosted",
+    "wellness",
+    "fitness",
+    "recovery",
+    "sleep",
+    "hrv",
     "training",
-    "claude"
+    "grok",
+    "claude",
+    "codex",
+    "openclaw"
   ],
   "author": "Jose Alvarado",
   "license": "MIT",
+  "homepage": "https://github.com/josealvaradoa/whoop-personal-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/josealvaradoa/whoop-personal-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/josealvaradoa/whoop-personal-mcp/issues"
+  },
+  "mcpName": "io.github.josealvaradoa/whoop-personal-mcp",
   "engines": {
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "better-sqlite3": "^12.8.0",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "zod": "^4.3.6"
+    "@modelcontextprotocol/express": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server-legacy": "2.0.0",
+    "better-sqlite3": "13.0.3",
+    "dotenv": "17.4.2",
+    "express": "5.2.1",
+    "zod": "4.4.3"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
@@ -46,12 +100,6 @@
     "typescript": "^5.9.3",
     "undici": "^6.21.3",
     "vitest": "^3.2.4"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3",
-      "esbuild"
-    ]
   },
   "packageManager": "pnpm@10.32.1+sha512.a706938f0e89ac1456b6563eab4edf1d1faf3368d1191fc5c59790e96dc918e4456ab2e67d613de1043d2e8c81f87303e6b40d4ffeca9df15ef1ad567348f2be"
 }

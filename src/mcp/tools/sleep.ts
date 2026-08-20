@@ -1,8 +1,15 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { daysAgo, today, getSleepCollection } from "../../whoop/client.js";
-import { mapSleepToDay, computeSleepTrend, isNightSleep } from "../../compute/sleep.js";
-import { defineTool, READ_ONLY_ANNOTATIONS, daysSinceUTC } from "./helpers.js";
+import {
+  mapSleepToDay,
+  computeSleepTrend,
+  isNightSleep,
+  isSleepDayData,
+} from "../../compute/sleep.js";
+import { calendarDaysSince } from "../../compute/stats.js";
+import { config } from "../../config.js";
+import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
 
 export function registerSleepTool(server: McpServer): void {
   defineTool(
@@ -11,7 +18,7 @@ export function registerSleepTool(server: McpServer): void {
     {
       title: "Sleep Trend",
       description:
-        "Get sleep trend data: duration, efficiency, consistency, and cumulative sleep debt over a time window. Naps and unscored records are excluded — only full nights of sleep are counted, each dated by its wake day so it aligns with that morning's recovery. Computed fields are null when there is no scored nightly-sleep data for the window (null never means zero). as_of_date is the most recent day with data; if days_since_last_data is more than a day or two the figures are stale.",
+        "Get scored nightly-sleep context. WHOOP Sleep Need and its positive sleep-debt contribution are kept distinct from sleep_duration_balance_7d_hrs, a signed arithmetic balance against an explicitly configured duration target (positive=above, negative=below). duration_direction neutrally reports whether the recent window is longer, shorter, or similar to the prior window; it does not label more sleep as inherently better. Native WHOOP consistency is reported; duration variability is not mislabeled as bedtime consistency. Naps/unscored records are excluded and nights are dated by wake day. This is wellness context, not treatment advice.",
       inputSchema: {
         days: z.number().int().min(3).max(365).optional().default(14).describe("Number of days to look back. Minimum 3, maximum 365, default 14."),
       },
@@ -21,6 +28,9 @@ export function registerSleepTool(server: McpServer): void {
             z.object({
               date: z.string(),
               duration_hrs: z.number(),
+              sleep_need_hrs: z.number().nullable(),
+              whoop_sleep_debt_hrs: z.number().nullable(),
+              consistency_pct: z.number().nullable(),
               efficiency_pct: z.number().nullable(),
               performance_pct: z.number().nullable(),
               respiratory_rate: z.number().nullable(),
@@ -35,10 +45,14 @@ export function registerSleepTool(server: McpServer): void {
         }),
         computed: z.object({
           avg_duration_7d_hrs: z.number().nullable(),
+          avg_sleep_need_7d_hrs: z.number().nullable(),
           avg_efficiency_7d_pct: z.number().nullable(),
-          sleep_debt_cumulative_hrs: z.number().nullable(),
-          consistency_score: z.number().nullable(),
-          trend: z.enum(["improving", "declining", "stable"]).nullable(),
+          avg_consistency_7d_pct: z.number().nullable(),
+          configured_sleep_target_hrs: z.number().nullable(),
+          sleep_duration_balance_7d_hrs: z.number().nullable(),
+          latest_whoop_sleep_debt_hrs: z.number().nullable(),
+          nights_with_data_7d: z.number(),
+          duration_direction: z.enum(["longer", "shorter", "similar"]).nullable(),
           as_of_date: z.string().nullable(),
           days_since_last_data: z.number().nullable(),
         }),
@@ -48,14 +62,20 @@ export function registerSleepTool(server: McpServer): void {
     },
     async ({ days }) => {
       const sleeps = await getSleepCollection(daysAgo(days), today());
-      const sleepDays = sleeps.filter(isNightSleep).map(mapSleepToDay);
+      const sleepDays = sleeps
+        .filter(isNightSleep)
+        .map((sleep) => mapSleepToDay(sleep, config.athlete.timezone))
+        .filter(isSleepDayData);
       const computed = computeSleepTrend(sleepDays);
 
       return {
         raw: { daily_sleep: sleepDays },
         computed: {
           ...computed,
-          days_since_last_data: daysSinceUTC(computed.as_of_date),
+          days_since_last_data: calendarDaysSince(
+            computed.as_of_date,
+            config.athlete.timezone,
+          ),
         },
       };
     },

@@ -4,6 +4,9 @@ import {
   stddev,
   roundTo,
   dayDiff,
+  calendarDate,
+  calendarDaysSince,
+  shiftCalendarDate,
   kjToKcal,
   KJ_TO_KCAL,
   dedupeByDay,
@@ -70,6 +73,29 @@ describe("dayDiff", () => {
   });
   it("crosses month boundaries correctly", () => {
     expect(dayDiff("2026-07-01", "2026-06-30")).toBe(1);
+  });
+});
+
+describe("owner-timezone calendar helpers", () => {
+  it("dates the same instant according to the configured owner timezone", () => {
+    const instant = "2026-06-15T01:30:00.000Z";
+    expect(calendarDate(instant, "America/New_York")).toBe("2026-06-14");
+    expect(calendarDate(instant, "Asia/Tokyo")).toBe("2026-06-15");
+    expect(calendarDate("not-a-timestamp", "UTC")).toBeNull();
+  });
+
+  it("uses the owner-local today as the staleness anchor", () => {
+    const now = new Date("2026-06-15T01:30:00.000Z");
+    expect(calendarDaysSince("2026-06-13", "America/New_York", now)).toBe(1);
+    expect(calendarDaysSince("2026-06-14", "Asia/Tokyo", now)).toBe(1);
+    expect(calendarDaysSince(null, "UTC", now)).toBeNull();
+  });
+
+  it("shifts date-only windows exactly across a daylight-saving transition", () => {
+    // America/New_York changed clocks on 2026-03-08. Date-only arithmetic must
+    // still produce exactly seven inclusive calendar dates (today + prior six).
+    expect(shiftCalendarDate("2026-03-12", -6)).toBe("2026-03-06");
+    expect(shiftCalendarDate("2026-03-09", -1)).toBe("2026-03-08");
   });
 });
 

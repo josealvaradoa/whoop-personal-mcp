@@ -1,7 +1,8 @@
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { daysAgo, today, getWorkoutCollection } from "../../whoop/client.js";
-import { kjToKcal } from "../../compute/stats.js";
+import { calendarDate, kjToKcal, shiftCalendarDate } from "../../compute/stats.js";
+import { config } from "../../config.js";
 import { defineTool, READ_ONLY_ANNOTATIONS } from "./helpers.js";
 
 const MILLI_TO_MIN = 1 / (1000 * 60);
@@ -13,7 +14,7 @@ export function registerWorkoutsTool(server: McpServer): void {
     {
       title: "Workout History",
       description:
-        "Get workout history with sport type, strain, duration, heart rate data, and HR zone distribution. Includes weekly volume and intensity analysis. Only WHOOP-scored workouts are included; counts and totals are zero only when no matching workouts were logged (they are never fabricated from missing data). avg_hr/max_hr are null when WHOOP did not record them. A single dirty record (e.g. a bad timestamp) is dropped rather than failing the whole request.",
+        "Get scored workout history with sport, per-workout Strain, duration, heart rate, and heart-rate-zone time. The requested raw window and sport distribution use the requested number of days; weekly volume/count and zone distribution always use a complete trailing 7-day fetch. WHOOP Strain is nonlinear and is never summed across workouts or presented as an injury/safety threshold. Counts and durations are zero only when no matching scored workouts were logged. This is wellness context, not medical advice or exercise clearance.",
       inputSchema: {
         days: z.number().int().min(1).max(365).optional().default(14).describe("Number of days to look back. Minimum 1, maximum 365, default 14."),
         sport: z.string().optional().describe("Filter by sport name (e.g. 'running', 'cycling', 'swimming'). Optional."),
@@ -41,8 +42,8 @@ export function registerWorkoutsTool(server: McpServer): void {
         }),
         computed: z.object({
           total_workouts: z.number(),
+          weekly_workout_count: z.number(),
           weekly_volume_hrs: z.number(),
-          weekly_strain_total: z.number(),
           sport_distribution: z.record(z.string(), z.number()),
           intensity_distribution: z.object({
             zone1_2_pct: z.number(),
@@ -55,7 +56,14 @@ export function registerWorkoutsTool(server: McpServer): void {
       errorLabel: "fetching workouts",
     },
     async ({ days, sport }) => {
-      const workouts = await getWorkoutCollection(daysAgo(days), today());
+      const ownerToday = calendarDate(new Date(), config.athlete.timezone);
+      if (ownerToday == null) {
+        throw new Error("Unable to establish the requested calendar window");
+      }
+      const requestedStart = shiftCalendarDate(ownerToday, -(days - 1));
+      // Today plus the prior six owner-local dates is a seven-calendar-day window.
+      const weeklyStart = shiftCalendarDate(ownerToday, -6);
+      const workouts = await getWorkoutCollection(daysAgo(Math.max(days, 7)), today());
 
       const isFiniteNum = (n: unknown): n is number =>
         typeof n === "number" && Number.isFinite(n);
@@ -63,7 +71,7 @@ export function registerWorkoutsTool(server: McpServer): void {
       // A missing zone breakdown is genuinely 0 minutes in that zone, not a fabricated
       // metric — coerce non-finite millis to 0 so one dirty field can't NaN the record.
       const zoneMin = (milli: unknown): number =>
-        isFiniteNum(milli) ? Math.round(milli * MILLI_TO_MIN) : 0;
+        isFiniteNum(milli) && milli >= 0 ? Math.round(milli * MILLI_TO_MIN) : 0;
 
       // Map to readable format — filter out unscored workouts. One dirty record must
       // degrade gracefully (dropped or nulled), never fail the whole tool: a NaN in a
@@ -75,17 +83,21 @@ export function registerWorkoutsTool(server: McpServer): void {
           const durationMin = Math.round(
             (new Date(w.end).getTime() - new Date(w.start).getTime()) / (1000 * 60)
           );
+          const date = calendarDate(w.start, config.athlete.timezone);
           // Core numerics must be finite to aggregate honestly. A bad timestamp (NaN
           // duration) or dirty strain/kilojoule drops just this workout.
           if (
+            date == null ||
             !isFiniteNum(durationMin) ||
+            durationMin <= 0 ||
             !isFiniteNum(w.score.strain) ||
-            !isFiniteNum(w.score.kilojoule)
+            !isFiniteNum(w.score.kilojoule) ||
+            w.score.kilojoule < 0
           ) {
             return null;
           }
           return {
-            date: w.start.split("T")[0],
+            date,
             sport: w.sport_name,
             strain: w.score.strain,
             duration_min: durationMin,
@@ -104,17 +116,18 @@ export function registerWorkoutsTool(server: McpServer): void {
         })
         .filter((w): w is NonNullable<typeof w> => w !== null);
 
-      // Filter by sport if specified
-      const filtered = sport
+      const sportFiltered = sport
         ? mapped.filter((w) => w.sport.toLowerCase() === sport.toLowerCase())
         : mapped;
+      const filtered = sportFiltered.filter((workout) => workout.date >= requestedStart);
 
-      // Compute: last 7 days only
-      const sevenDaysAgo = new Date(daysAgo(7)).toISOString().split("T")[0];
-      const last7 = filtered.filter((w) => w.date >= sevenDaysAgo);
+      // Weekly fields use the independently fetched trailing seven-day window even
+      // when the caller asks for fewer raw-history days.
+      const last7 = sportFiltered.filter((workout) => workout.date >= weeklyStart);
 
-      const weeklyVolumeHrs = Math.round((last7.reduce((s, w) => s + w.duration_min, 0) / 60) * 10) / 10;
-      const weeklyStrainTotal = Math.round(last7.reduce((s, w) => s + w.strain, 0) * 10) / 10;
+      const weeklyVolumeHrs =
+        Math.round((last7.reduce((sum, workout) => sum + workout.duration_min, 0) / 60) * 10) /
+        10;
 
       // Sport distribution (full window)
       const sportDist: Record<string, number> = {};
@@ -143,8 +156,8 @@ export function registerWorkoutsTool(server: McpServer): void {
         raw: { workouts: filtered },
         computed: {
           total_workouts: filtered.length,
+          weekly_workout_count: last7.length,
           weekly_volume_hrs: weeklyVolumeHrs,
-          weekly_strain_total: weeklyStrainTotal,
           sport_distribution: sportDist,
           intensity_distribution: intensityDist,
         },

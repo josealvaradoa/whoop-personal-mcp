@@ -1,189 +1,192 @@
 import { describe, it, expect } from "vitest";
+import { config } from "../../src/config.js";
 import {
-  computeFitnessTrend,
-  computeFatigueStatus,
-  computeKeyConcerns,
-  buildWeeklySummary,
-  getDaysToRace,
-  getCurrentPhase,
-  weeklyWorkoutVolumeHrs,
+  computeRecoveryContextStatus,
+  computeEventContextAssessmentStatus,
+  computeKeyObservations,
+  buildEventContextSummary,
+  getDaysToEvent,
+  getCurrentEventPhase,
 } from "../../src/compute/race-readiness.js";
-import { makeWorkout } from "../helpers/fixtures.js";
 
-describe("computeFitnessTrend", () => {
-  it("returns null when the ACWR zone is unknown", () => {
-    expect(computeFitnessTrend(null, "declining")).toBeNull();
+describe("computeRecoveryContextStatus", () => {
+  it("surfaces a repeated red-band observation despite sparse averages", () => {
+    expect(computeRecoveryContextStatus(null, null, 3, 0, 0, 0)).toBe(
+      "red_band_streak_alert",
+    );
+    expect(computeRecoveryContextStatus(80, 80, 5, 7, 30, 0)).toBe(
+      "red_band_streak_alert",
+    );
   });
-  it("maps danger/caution/undertrained zones directly", () => {
-    expect(computeFitnessTrend("danger", "improving")).toBe("injury_risk");
-    expect(computeFitnessTrend("caution", "stable")).toBe("overreaching");
-    expect(computeFitnessTrend("undertrained", "improving")).toBe("undertrained");
+
+  it("abstains when recent or longer-window coverage is insufficient", () => {
+    expect(computeRecoveryContextStatus(40, 50, 0, 3, 30, 0)).toBeNull();
+    expect(computeRecoveryContextStatus(40, 50, 0, 7, 13, 0)).toBeNull();
+    expect(computeRecoveryContextStatus(null, 50, 0, 7, 30, 0)).toBeNull();
   });
-  it("optimal zone with DECLINING recovery is an early-overreach signal (the fixed branch)", () => {
-    expect(computeFitnessTrend("optimal", "declining")).toBe("overreaching");
+
+  it("withholds repeated red-band observations when Recovery is stale or future-dated", () => {
+    expect(computeRecoveryContextStatus(20, 30, 3, 7, 30, 3)).toBeNull();
+    expect(computeRecoveryContextStatus(20, 30, 3, 7, 30, -1)).toBeNull();
+    expect(computeRecoveryContextStatus(20, 30, 3, 7, 30, null)).toBeNull();
   });
-  it("optimal zone otherwise reads on_track", () => {
-    expect(computeFitnessTrend("optimal", "improving")).toBe("on_track");
-    expect(computeFitnessTrend("optimal", "stable")).toBe("on_track");
-    expect(computeFitnessTrend("optimal", null)).toBe("on_track");
+
+  it("describes the recent Recovery average relative to the longer average", () => {
+    expect(computeRecoveryContextStatus(60, 50, 0, 7, 30, 0)).toBe("above_longer_average");
+    expect(computeRecoveryContextStatus(52, 50, 0, 7, 30, 0)).toBe("similar_to_longer_average");
+    expect(computeRecoveryContextStatus(40, 50, 0, 7, 30, 0)).toBe("below_longer_average");
   });
 });
 
-describe("computeFatigueStatus (consecutive-red alert threshold 3)", () => {
-  it("is critical once the consecutive-red alert threshold is reached, regardless of averages", () => {
-    expect(computeFatigueStatus(null, null, 3)).toBe("critical");
-    expect(computeFatigueStatus(80, 80, 5)).toBe("critical");
-  });
-  it("returns null when averages are missing (and no red alert)", () => {
-    expect(computeFatigueStatus(null, 50, 0)).toBeNull();
-    expect(computeFatigueStatus(50, null, 0)).toBeNull();
-    expect(computeFatigueStatus(50, 0, 0)).toBeNull();
-  });
-  it("classifies fresh / manageable / accumulating from the 7d-vs-30d delta", () => {
-    expect(computeFatigueStatus(60, 50, 0)).toBe("fresh"); // +20%
-    expect(computeFatigueStatus(52, 50, 0)).toBe("manageable"); // +4%
-    expect(computeFatigueStatus(40, 50, 0)).toBe("accumulating"); // -20%
-  });
-});
-
-describe("computeKeyConcerns", () => {
-  const base = {
-    sleepDebtHrs: -1,
-    monotony: 1,
-    acwr: 1.0,
-    recoveryTrend: "stable" as const,
-    hrvTrend: "stable" as const,
-    weeklyVolumeHrs: 10,
-    currentPhase: "build",
+describe("computeEventContextAssessmentStatus", () => {
+  const complete = {
+    eventConfigured: true,
+    recoveryDays7d: 7,
+    recoveryDays30d: 30,
+    hrvDays7d: 7,
+    hrvDays30d: 30,
+    sleepNights7d: 7,
+    recoveryAgeDays: 0,
+    hrvAgeDays: 0,
+    sleepAgeDays: 0,
   };
 
-  it("returns no concerns when everything is within range", () => {
-    expect(computeKeyConcerns(base)).toEqual([]);
-  });
-
-  it("flags sleep debt, monotony, danger-zone ACWR and declining recovery/HRV", () => {
-    const c = computeKeyConcerns({
-      ...base,
-      sleepDebtHrs: -5,
-      monotony: 2.5,
-      acwr: 1.6,
-      recoveryTrend: "declining",
-      hrvTrend: "declining",
-    });
-    expect(c).toEqual(
-      expect.arrayContaining([
-        "sleep_debt",
-        "high_monotony",
-        "acwr_danger",
-        "declining_recovery",
-        "declining_hrv",
-      ]),
+  it("abstains when no event is configured", () => {
+    expect(computeEventContextAssessmentStatus({ ...complete, eventConfigured: false })).toBe(
+      "event_not_configured",
     );
-    expect(c).not.toContain("acwr_high"); // danger and high are mutually exclusive
   });
 
-  it("uses acwr_high (not danger) for elevated-but-not-dangerous ACWR", () => {
-    expect(computeKeyConcerns({ ...base, acwr: 1.4 })).toContain("acwr_high");
-  });
-
-  it("flags low_volume only in build/peak phases", () => {
-    expect(computeKeyConcerns({ ...base, weeklyVolumeHrs: 3, currentPhase: "build" })).toContain(
-      "low_volume",
+  it("abstains when any required signal has insufficient coverage", () => {
+    expect(computeEventContextAssessmentStatus({ ...complete, recoveryDays30d: 13 })).toBe(
+      "insufficient_data",
     );
-    expect(
-      computeKeyConcerns({ ...base, weeklyVolumeHrs: 3, currentPhase: "base_building" }),
-    ).not.toContain("low_volume");
+    expect(computeEventContextAssessmentStatus({ ...complete, hrvDays7d: 4 })).toBe(
+      "insufficient_data",
+    );
+    expect(computeEventContextAssessmentStatus({ ...complete, sleepNights7d: 3 })).toBe(
+      "insufficient_data",
+    );
   });
 
-  it("never invents concerns from null inputs", () => {
+  it("abstains when any required signal is missing, stale, or future-dated", () => {
+    expect(computeEventContextAssessmentStatus({ ...complete, sleepAgeDays: null })).toBe(
+      "stale_data",
+    );
+    expect(computeEventContextAssessmentStatus({ ...complete, hrvAgeDays: 3 })).toBe("stale_data");
+    expect(computeEventContextAssessmentStatus({ ...complete, recoveryAgeDays: -1 })).toBe(
+      "stale_data",
+    );
+  });
+
+  it("returns context_available only with complete, recent inputs", () => {
+    expect(computeEventContextAssessmentStatus(complete)).toBe("context_available");
+  });
+});
+
+describe("computeKeyObservations", () => {
+  it("uses neutral observations and never considers the experimental ratio or monotony", () => {
     expect(
-      computeKeyConcerns({
-        sleepDebtHrs: null,
-        monotony: null,
-        acwr: null,
+      computeKeyObservations({
+        assessmentStatus: "context_available",
+        recoveryContextStatus: "red_band_streak_alert",
+        whoopSleepDebtHrs: 1.5,
+        sleepDurationBalanceHrs: -2,
+        recoveryTrend: "declining",
+        hrvTrend: "declining",
+      }),
+    ).toEqual([
+      "red_band_streak_observed",
+      "whoop_sleep_debt_present",
+      "sleep_below_configured_target",
+      "declining_recovery_trend",
+      "declining_hrv_trend",
+    ]);
+  });
+
+  it("does not invent observations from unavailable values", () => {
+    expect(
+      computeKeyObservations({
+        assessmentStatus: "context_available",
+        recoveryContextStatus: null,
+        whoopSleepDebtHrs: null,
+        sleepDurationBalanceHrs: null,
         recoveryTrend: null,
         hrvTrend: null,
-        weeklyVolumeHrs: null,
-        currentPhase: "build",
       }),
     ).toEqual([]);
   });
-});
 
-describe("buildWeeklySummary", () => {
-  it("summarizes a healthy week and appends the default recommendation", () => {
-    const s = buildWeeklySummary({
-      recoveryTrend: "improving",
-      acwrZone: "optimal",
-      acwr: 1.0,
-      concerns: [],
-      fatigueStatus: "fresh",
-    });
-    expect(s).toContain("Recovery trending well.");
-    expect(s).toContain("ACWR is 1 (optimal zone).");
-    expect(s).toContain("Continue current plan.");
-  });
-
-  it("surfaces declining recovery and a danger-zone concern (no default recommendation)", () => {
-    const s = buildWeeklySummary({
-      recoveryTrend: "declining",
-      acwrZone: "danger",
-      acwr: 1.8,
-      concerns: ["acwr_danger"],
-      fatigueStatus: "critical",
-    });
-    expect(s).toContain("Recovery has been declining.");
-    expect(s).toContain("ACWR is 1.8 (danger zone).");
-    expect(s).toContain("mandatory deload");
-    expect(s).not.toContain("Continue current plan.");
-  });
-
-  it("states when the recovery trend and ACWR are unavailable", () => {
-    const s = buildWeeklySummary({
-      recoveryTrend: null,
-      acwrZone: null,
-      acwr: null,
-      concerns: [],
-      fatigueStatus: null,
-    });
-    expect(s).toContain("Recovery trend is unavailable (insufficient recent data).");
-    expect(s).not.toContain("ACWR is"); // null ACWR is omitted entirely
-    expect(s).toContain("Continue current plan.");
-  });
-});
-
-describe("weeklyWorkoutVolumeHrs (fix 6 — SCORED workouts only)", () => {
-  it("sums only SCORED workouts; unscored activities never inflate volume", () => {
-    const workouts = [
-      makeWorkout({ date: "2026-06-15", durationMin: 60 }), // SCORED → 1.0h
-      makeWorkout({ date: "2026-06-14", durationMin: 90, scoreState: "PENDING_SCORE" }), // excluded
-      makeWorkout({ date: "2026-06-13", durationMin: 30 }), // SCORED → 0.5h
-    ];
-    // Only the two SCORED workouts count: 60 + 30 min = 1.5h (the 90-min pending is out).
-    expect(weeklyWorkoutVolumeHrs(workouts)).toBe(1.5);
-  });
-
-  it("is a real 0 (never NaN) when there are no scored workouts", () => {
-    expect(weeklyWorkoutVolumeHrs([])).toBe(0);
+  it("withholds structured interpretations when inputs are stale", () => {
     expect(
-      weeklyWorkoutVolumeHrs([makeWorkout({ date: "2026-06-15", scoreState: "PENDING_SCORE" })]),
-    ).toBe(0);
+      computeKeyObservations({
+        assessmentStatus: "stale_data",
+        recoveryContextStatus: "below_longer_average",
+        whoopSleepDebtHrs: 2,
+        sleepDurationBalanceHrs: -2,
+        recoveryTrend: "declining",
+        hrvTrend: "declining",
+      }),
+    ).toEqual([]);
   });
 
-  it("skips a workout with a non-finite duration (bad timestamp) rather than NaN-ing the sum", () => {
-    const good = makeWorkout({ date: "2026-06-15", durationMin: 60 });
-    const badTs = makeWorkout({ date: "2026-06-14", durationMin: 60 });
-    (badTs as { end: string }).end = "not-a-timestamp";
-    expect(weeklyWorkoutVolumeHrs([good, badTs])).toBe(1); // only the good 60-min workout
+  it("keeps only a fresh red-band streak when other coverage is insufficient", () => {
+    expect(
+      computeKeyObservations({
+        assessmentStatus: "insufficient_data",
+        recoveryContextStatus: "red_band_streak_alert",
+        whoopSleepDebtHrs: 2,
+        sleepDurationBalanceHrs: -2,
+        recoveryTrend: "declining",
+        hrvTrend: "declining",
+      }),
+    ).toEqual(["red_band_streak_observed"]);
   });
 });
 
-describe("getDaysToRace / getCurrentPhase (config-driven, clock-dependent)", () => {
-  it("returns an integer number of days to the configured race", () => {
-    expect(Number.isInteger(getDaysToRace())).toBe(true);
+describe("buildEventContextSummary", () => {
+  it("leads with a neutral repeated red-band observation even while abstaining", () => {
+    const summary = buildEventContextSummary({
+      assessmentStatus: "insufficient_data",
+      recoveryTrend: null,
+      recoveryContextStatus: "red_band_streak_alert",
+      observations: ["red_band_streak_observed"],
+    });
+    expect(summary.startsWith("Recent repeated red-band Recovery observation")).toBe(true);
+    expect(summary).toContain("withheld");
+    expect(summary).toContain("not medical advice");
+    expect(summary).not.toMatch(/critical|fatigue|continue current plan|mandatory deload/i);
   });
-  it("returns a known phase name or off_season", () => {
-    const valid = new Set(["base_building", "build", "peak", "taper", "race_week", "off_season"]);
-    expect(valid.has(getCurrentPhase())).toBe(true);
+
+  it("describes available context without issuing a training prescription", () => {
+    const summary = buildEventContextSummary({
+      assessmentStatus: "context_available",
+      recoveryTrend: "declining",
+      recoveryContextStatus: "below_longer_average",
+      observations: ["declining_recovery_trend", "whoop_sleep_debt_present"],
+    });
+    expect(summary).toContain("recent Recovery average is below");
+    expect(summary).toContain("WHOOP reports a positive sleep-debt contribution");
+    expect(summary).toContain("not medical advice");
+    expect(summary).not.toMatch(/rest day|deload|safe|injury risk/i);
+  });
+});
+
+describe("configured event helpers", () => {
+  it("returns null rather than inventing an event when none is configured", () => {
+    if (config.event) {
+      expect(Number.isInteger(getDaysToEvent())).toBe(true);
+      expect(typeof getCurrentEventPhase()).toBe("string");
+    } else {
+      expect(getDaysToEvent()).toBeNull();
+      expect(getCurrentEventPhase()).toBeNull();
+    }
+  });
+
+  it("uses the owner timezone's local date for days-to-event", () => {
+    if (!config.event) return;
+    const nearMidnightUtc = new Date(`${config.event.date}T01:00:00.000Z`);
+    expect(getDaysToEvent(nearMidnightUtc, "UTC")).toBe(0);
+    expect(getDaysToEvent(nearMidnightUtc, "America/New_York")).toBe(1);
   });
 });

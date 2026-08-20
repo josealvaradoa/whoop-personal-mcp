@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "vitest";
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
+import type { Client } from "@modelcontextprotocol/client";
+import type { McpServer } from "@modelcontextprotocol/server";
 import type { MockAgent } from "undici";
-import { useIsolatedDataDir, initTestDb, seedWhoopTokens, clearCache } from "../helpers/db.js";
+import { useIsolatedDataDir, initTestDb, seedWhoopTokens } from "../helpers/db.js";
 
 // Isolate DATA_DIR before any getDb() call (getDb reads DATA_DIR lazily).
 useIsolatedDataDir("contract");
@@ -19,6 +19,8 @@ import {
   shiftDay,
 } from "../helpers/fixtures.js";
 import { daysAgo } from "../../src/whoop/client.js";
+import { calendarDate, shiftCalendarDate } from "../../src/compute/stats.js";
+import { config } from "../../src/config.js";
 
 const todayUtc = (): string => new Date().toISOString().split("T")[0];
 
@@ -40,10 +42,6 @@ afterAll(async () => {
   await server.close();
 });
 
-beforeEach(() => {
-  clearCache(); // date-keyed cache entries must not leak between tests
-});
-
 afterEach(async () => {
   await uninstallWhoopMock(mock);
   mock = undefined;
@@ -54,10 +52,10 @@ async function callTool(name: string, args: Record<string, unknown> = {}): Promi
 }
 
 describe("MCP contract — tools/list", () => {
-  it("registers exactly the 7 whoop_* tools", async () => {
+  it("registers the six base tools and event context only when an event is configured", async () => {
     const { tools } = await client.listTools();
-    const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual([...EXPECTED_TOOL_NAMES].sort());
+    const names = tools.map((t) => t.name);
+    expect(names).toEqual(EXPECTED_TOOL_NAMES);
     expect(tools.every((t) => t.name.startsWith("whoop_"))).toBe(true);
   });
 
@@ -69,6 +67,31 @@ describe("MCP contract — tools/list", () => {
       expect((tool.annotations as Any)?.readOnlyHint, `${tool.name} readOnlyHint`).toBe(true);
       expect((tool.annotations as Any)?.idempotentHint, `${tool.name} idempotentHint`).toBe(true);
     }
+  });
+});
+
+describe("MCP contract — provider-neutral prompt and usage-policy resource", () => {
+  it("publishes a safe wellness-summary prompt", async () => {
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((prompt) => prompt.name)).toContain("summarize_wellness_context");
+    const prompt = await client.getPrompt({ name: "summarize_wellness_context" });
+    const textContent = prompt.messages[0]?.content as Any;
+    expect(textContent.type).toBe("text");
+    expect(textContent.text).toContain("Treat null as unavailable, never zero");
+    expect(textContent.text).toContain("not a validated acute-to-chronic workload ratio");
+    expect(textContent.text).toContain("Do not diagnose");
+    expect(textContent.text).not.toMatch(/full training|mandatory deload|continue current plan/i);
+  });
+
+  it("publishes a static single-user wellness-only usage policy", async () => {
+    const { resources } = await client.listResources();
+    expect(resources.map((resource) => resource.uri)).toContain("whoop://server/usage-policy");
+    const resource = await client.readResource({ uri: "whoop://server/usage-policy" });
+    const contents = resource.contents[0] as Any;
+    expect(contents.mimeType).toBe("text/markdown");
+    expect(contents.text).toContain("read-only, single-user, self-hosted connector");
+    expect(contents.text).toContain("has no threshold bands");
+    expect(contents.text).toContain("Event context");
   });
 });
 
@@ -91,7 +114,7 @@ describe("MCP contract — NULL semantics when WHOOP has no data", () => {
     mock = installWhoopMock({}); // all collections empty
   });
 
-  it("today_overview reports missing (null metrics, false flags, null readiness — never 0)", async () => {
+  it("today_overview reports missing metrics and no product band — never 0", async () => {
     const { structuredContent: sc } = await callTool("whoop_get_today_overview");
     expect(sc.raw.recovery_score).toBeNull();
     expect(sc.raw.hrv_rmssd).toBeNull();
@@ -100,8 +123,9 @@ describe("MCP contract — NULL semantics when WHOOP has no data", () => {
     expect(sc.computed.recovery_available).toBe(false);
     expect(sc.computed.sleep_available).toBe(false);
     expect(sc.computed.strain_available).toBe(false);
-    expect(sc.computed.readiness).toBeNull();
-    expect(sc.computed.recommendation).toBeNull();
+    expect(sc.computed.recovery_band).toBeNull();
+    expect(sc.computed.wellness_context_only).toBe(true);
+    expect(sc.computed).not.toHaveProperty("recommendation");
   });
 
   it("recovery_trend reports null averages/trend and zero streaks", async () => {
@@ -111,6 +135,8 @@ describe("MCP contract — NULL semantics when WHOOP has no data", () => {
     expect(sc.computed.avg_30d).toBeNull();
     expect(sc.computed.trend).toBeNull();
     expect(sc.computed.consecutive_red_days).toBe(0);
+    expect(sc.computed.days_with_data_7d).toBe(0);
+    expect(sc.computed.days_with_data_30d).toBe(0);
   });
 
   it("hrv_trend reports null everywhere including above_baseline", async () => {
@@ -120,35 +146,47 @@ describe("MCP contract — NULL semantics when WHOOP has no data", () => {
     expect(sc.computed.cv_pct).toBeNull();
     expect(sc.computed.trend).toBeNull();
     expect(sc.computed.above_baseline).toBeNull();
+    expect(sc.computed.days_with_data_7d).toBe(0);
+    expect(sc.computed.days_with_data_30d).toBe(0);
   });
 
   it("sleep_trend reports null metrics", async () => {
     const { structuredContent: sc } = await callTool("whoop_get_sleep_trend");
     expect(sc.computed.avg_duration_7d_hrs).toBeNull();
-    expect(sc.computed.sleep_debt_cumulative_hrs).toBeNull();
-    expect(sc.computed.consistency_score).toBeNull();
-    expect(sc.computed.trend).toBeNull();
+    expect(sc.computed.latest_whoop_sleep_debt_hrs).toBeNull();
+    expect(sc.computed.sleep_duration_balance_7d_hrs).toBeNull();
+    expect(sc.computed.avg_consistency_7d_pct).toBeNull();
+    expect(sc.computed.nights_with_data_7d).toBe(0);
+    expect(sc.computed.duration_direction).toBeNull();
   });
 
-  it("training_load reports null ACWR/zone and zero completeness counts", async () => {
+  it("training_load reports a null experimental ratio and zero completeness counts", async () => {
     const { structuredContent: sc } = await callTool("whoop_get_training_load");
-    expect(sc.computed.acute_load_7d).toBeNull();
-    expect(sc.computed.acwr).toBeNull();
-    expect(sc.computed.acwr_zone).toBeNull();
+    expect(sc.computed.mean_day_strain_7d).toBeNull();
+    expect(sc.computed.experimental_mean_day_strain_ratio_7d_28d).toBeNull();
+    expect(sc.computed.is_experimental).toBe(true);
+    expect(sc.computed.limitations).toContain(
+      "not a validated acute-to-chronic workload ratio",
+    );
+    expect(sc.computed).not.toHaveProperty("acwr_reference_band_experimental");
     expect(sc.computed.days_with_data_7d).toBe(0);
   });
 
-  it("race_readiness leaves fitness_trend/fatigue_status null but keeps config-driven fields", async () => {
-    const { structuredContent: sc } = await callTool("whoop_get_race_readiness");
-    expect(sc.computed.fitness_trend).toBeNull();
-    expect(sc.computed.fatigue_status).toBeNull();
-    expect(typeof sc.computed.days_to_race).toBe("number");
+  const eventIt = EXPECTED_TOOL_NAMES.includes("whoop_get_event_context") ? it : it.skip;
+  eventIt("event context abstains on missing data and never returns clearance", async () => {
+    const { structuredContent: sc } = await callTool("whoop_get_event_context");
+    expect(sc.computed.recovery_context_status).toBeNull();
+    expect(sc.computed.assessment_status).toBe("insufficient_data");
+    expect(sc.computed.assessment_available).toBe(false);
+    expect(sc.computed.is_clearance).toBe(false);
+    expect(sc.computed.weekly_summary).toContain("withheld");
+    expect(typeof sc.computed.days_to_event).toBe("number");
     expect(typeof sc.computed.current_phase).toBe("string");
   });
 });
 
 describe("MCP contract — populated data flows through", () => {
-  it("today_overview surfaces recovery/sleep/strain and a readiness recommendation", async () => {
+  it("today_overview surfaces metrics and a WHOOP product band without a prescription", async () => {
     const data: WhoopData = {
       cycles: [makeCycle({ date: "2026-06-15", strain: 12, kilojoule: 8368, id: 1 })],
       recoveries: [makeRecovery({ cycleId: 1, recoveryScore: 75, hrv: 90, rhr: 48 })],
@@ -159,11 +197,56 @@ describe("MCP contract — populated data flows through", () => {
     expect(sc.computed.recovery_available).toBe(true);
     expect(sc.computed.sleep_available).toBe(true);
     expect(sc.computed.strain_available).toBe(true);
-    expect(sc.computed.readiness).toBe("green"); // 75 >= yellow threshold 66
-    expect(sc.computed.recommendation).toBe("full_training");
+    expect(sc.computed.recovery_band).toBe("green");
+    expect(sc.computed).not.toHaveProperty("recommendation");
     expect(sc.raw.recovery_score).toBe(75);
     expect(sc.raw.day_strain).toBe(12);
     expect(sc.raw.day_calories).toBe(2000); // round(8368 * 0.239006)
+  });
+
+  it("today_overview fetches enough sleep history to retain last night late the next day", async () => {
+    const lastNight = shiftDay(todayUtc(), -1);
+    mock = installWhoopMock({ sleeps: [makeSleep({ date: lastNight })] });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      const { structuredContent: sc } = await callTool("whoop_get_today_overview");
+      expect(sc.computed.sleep_available).toBe(true);
+      expect(sc.raw.sleep_date).toBe(lastNight);
+
+      const sleepCall = fetchSpy.mock.calls.find(([url]) =>
+        String(url).includes("/developer/v2/activity/sleep"),
+      );
+      expect(sleepCall, "overview should fetch the sleep collection").toBeDefined();
+      const query = new URL(String(sleepCall![0]));
+      const start = new Date(query.searchParams.get("start") as string).getTime();
+      const end = new Date(query.searchParams.get("end") as string).getTime();
+      expect(end - start).toBeGreaterThanOrEqual(72 * 60 * 60 * 1000 - 1000);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  const eventIt = EXPECTED_TOOL_NAMES.includes("whoop_get_event_context") ? it : it.skip;
+  eventIt("event context surfaces repeated red-band observations while abstaining", async () => {
+    const day = todayUtc();
+    const dates = [day, shiftDay(day, -1), shiftDay(day, -2)];
+    mock = installWhoopMock({
+      cycles: dates.map((date, index) => makeCycle({ date, id: index + 1 })),
+      recoveries: dates.map((_, index) =>
+        makeRecovery({ cycleId: index + 1, recoveryScore: 20 + index, hrv: 70, rhr: 52 }),
+      ),
+    });
+    const { structuredContent: sc } = await callTool("whoop_get_event_context");
+    expect(sc.computed.assessment_status).toBe("insufficient_data");
+    expect(sc.computed.assessment_available).toBe(false);
+    expect(sc.computed.recovery_context_status).toBe("red_band_streak_alert");
+    expect(sc.computed.red_streak_alert).toBe(true);
+    expect(sc.computed.key_observations).toContain("red_band_streak_observed");
+    expect(sc.computed.weekly_summary.startsWith("Recent repeated red-band Recovery observation")).toBe(
+      true,
+    );
+    expect(sc.computed.weekly_summary).not.toMatch(/critical|physiological fatigue/i);
+    expect(sc.computed.weekly_summary).not.toMatch(/mandatory deload|continue current plan/i);
   });
 });
 
@@ -272,11 +355,37 @@ describe("MCP contract — a dirty workout degrades gracefully (fix 9)", () => {
     // bad-timestamp workout dropped; the other two survive and validate.
     expect(sc.raw.workouts).toHaveLength(2);
     expect(sc.computed.total_workouts).toBe(2);
+    expect(sc.computed.weekly_workout_count).toBe(2);
     const cyc = sc.raw.workouts.find((w: Any) => w.sport === "cycling");
     expect(cyc.avg_hr).toBeNull();
     expect(cyc.max_hr).toBeNull();
     // volume sums the two good durations without NaN (60 + 60 = 2.0h).
     expect(sc.computed.weekly_volume_hrs).toBe(2);
+  });
+
+  it("includes the exact requested calendar-window boundary", async () => {
+    const ownerToday = calendarDate(new Date(), config.athlete.timezone);
+    if (ownerToday == null) throw new Error("test clock should produce a calendar date");
+    const boundary = shiftCalendarDate(ownerToday, -13); // 14 dates including today
+    mock = installWhoopMock({ workouts: [makeWorkout({ date: boundary, durationMin: 60 })] });
+    const { structuredContent: sc } = await callTool("whoop_get_workouts", { days: 14 });
+    expect(sc.raw.workouts.map((workout: Any) => workout.date)).toContain(boundary);
+  });
+
+  it("uses exactly today plus the prior six dates for weekly aggregates", async () => {
+    const ownerToday = calendarDate(new Date(), config.athlete.timezone);
+    if (ownerToday == null) throw new Error("test clock should produce a calendar date");
+    const included = shiftCalendarDate(ownerToday, -6);
+    const excluded = shiftCalendarDate(ownerToday, -7);
+    mock = installWhoopMock({
+      workouts: [
+        makeWorkout({ date: included, durationMin: 60 }),
+        makeWorkout({ date: excluded, durationMin: 60 }),
+      ],
+    });
+    const { structuredContent: sc } = await callTool("whoop_get_workouts", { days: 1 });
+    expect(sc.computed.weekly_workout_count).toBe(1);
+    expect(sc.computed.weekly_volume_hrs).toBe(1);
   });
 
   it("today_overview nulls a non-finite latest-recovery metric instead of failing (fix 9)", async () => {

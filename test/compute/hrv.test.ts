@@ -12,18 +12,28 @@ describe("computeHrvTrend", () => {
       cv_pct: null,
       trend: null,
       above_baseline: null,
+      days_with_data_7d: 0,
+      days_with_data_30d: 0,
       as_of_date: null,
     });
   });
 
-  it("computes the coefficient of variation over the acute window", () => {
-    // last-7 window has two days: hrv 40 (newest) and 60 → mean 50, stddev 10 → cv 20%
+  it("withholds CV and trends when fewer than five recent nights are measured", () => {
     const daily = consecutiveRecovery(D, [60, 60], [40, 60]);
     const r = computeHrvTrend(daily);
     expect(r.current_7d_avg).toBe(50);
-    expect(r.cv_pct).toBe(20);
-    expect(r.above_baseline).toBe(false); // 50 is not > baseline 50
-    expect(r.trend).toBe("stable");
+    expect(r.cv_pct).toBeNull();
+    expect(r.above_baseline).toBeNull();
+    expect(r.trend).toBeNull();
+    expect(r.days_with_data_7d).toBe(2);
+  });
+
+  it("computes recent CV with at least five measured nights", () => {
+    const daily = consecutiveRecovery(D, Array(5).fill(60), [40, 60, 50, 50, 50]);
+    const r = computeHrvTrend(daily);
+    expect(r.current_7d_avg).toBe(50);
+    expect(r.cv_pct).toBe(12.6);
+    expect(r.trend).toBeNull(); // the longer baseline still has fewer than 14 nights
   });
 
   it("flags current 7d above the 30d baseline and an improving trend", () => {

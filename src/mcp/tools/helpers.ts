@@ -1,7 +1,11 @@
-import type { McpServer, ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
-import type { z } from "zod";
-import { dayDiff } from "../../compute/stats.js";
+import type {
+  CallToolResult,
+  McpServer,
+  ToolAnnotations,
+} from "@modelcontextprotocol/server";
+import { z } from "zod";
+import { calendarDaysSince } from "../../compute/stats.js";
+import { config } from "../../config.js";
 
 type Shape = z.ZodRawShape;
 type Infer<S extends Shape> = z.infer<z.ZodObject<S>>;
@@ -12,12 +16,9 @@ type Infer<S extends Shape> = z.infer<z.ZodObject<S>>;
 // window silently drops boundary recoveries — e.g. "this morning's" recovery).
 export const CYCLE_DATING_BUFFER_DAYS = 5;
 
-// Integer calendar days between server-UTC "today" and `asOfDate` (the newest day
-// with data). null when there is no data. A large value signals a stale sync.
-export function daysSinceUTC(asOfDate: string | null): number | null {
-  if (asOfDate == null) return null;
-  const todayUtc = new Date().toISOString().split("T")[0];
-  return dayDiff(todayUtc, asOfDate);
+// Integer owner-local calendar days since the newest day with data.
+export function daysSinceOwnerDate(asOfDate: string | null): number | null {
+  return calendarDaysSince(asOfDate, config.athlete.timezone);
 }
 
 // Every WHOOP tool is a read-only, idempotent lookup against the external API.
@@ -27,6 +28,124 @@ export const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
   idempotentHint: true,
   openWorldHint: true,
 };
+
+export const WELLNESS_NOTICE =
+  "Wellness information only. This server does not diagnose, treat, prevent, or clear anyone for exercise. Use symptoms, personal context, and qualified medical or coaching advice for decisions.";
+
+type SafeToolError = {
+  code:
+    | "AUTH_REQUIRED"
+    | "RATE_LIMITED"
+    | "UPSTREAM_TIMEOUT"
+    | "UPSTREAM_UNAVAILABLE"
+    | "TEMPORARY_FAILURE";
+  message: string;
+  retryable: boolean;
+  retry_after_seconds?: number;
+};
+
+type CodedWhoopError = {
+  code: string;
+  retryable: boolean;
+  retryAfterSeconds?: number;
+};
+
+function isCodedWhoopError(err: unknown): err is CodedWhoopError {
+  return typeof err === "object" && err !== null &&
+    "code" in err && typeof err.code === "string" &&
+    "retryable" in err && typeof err.retryable === "boolean";
+}
+
+function classifyToolError(err: unknown): SafeToolError {
+  // The WHOOP client/auth layers expose stable, privacy-safe error codes. Prefer
+  // those over parsing human-readable messages, which are deliberately generic.
+  if (isCodedWhoopError(err)) {
+    if (err.code === "AUTH_REQUIRED" || err.code === "UPSTREAM_AUTH_REJECTED") {
+      return {
+        code: "AUTH_REQUIRED",
+        message: "The instance owner must link or re-link the WHOOP account.",
+        retryable: false,
+      };
+    }
+    if (err.code === "RATE_LIMITED" || err.code === "UPSTREAM_RATE_LIMITED") {
+      return {
+        code: "RATE_LIMITED",
+        message: "WHOOP is rate limiting requests. Try again later.",
+        retryable: true,
+        ...(err.retryAfterSeconds == null
+          ? {}
+          : { retry_after_seconds: err.retryAfterSeconds }),
+      };
+    }
+    if (err.code === "UPSTREAM_TIMEOUT") {
+      return {
+        code: "UPSTREAM_TIMEOUT",
+        message: "WHOOP did not respond before the request timeout.",
+        retryable: true,
+      };
+    }
+    if (err.code === "UPSTREAM_UNAVAILABLE" || err.code === "UPSTREAM_INVALID_RESPONSE") {
+      return {
+        code: "UPSTREAM_UNAVAILABLE",
+        message: "WHOOP is temporarily unavailable.",
+        retryable: err.retryable,
+      };
+    }
+  }
+
+  const detail = err instanceof Error ? err.message.toLowerCase() : "";
+
+  if (
+    detail.includes("no tokens stored") ||
+    detail.includes("re-authorize") ||
+    detail.includes("reauthorize") ||
+    detail.includes("invalid or expired token")
+  ) {
+    return {
+      code: "AUTH_REQUIRED",
+      message: "The instance owner must link or re-link the WHOOP account.",
+      retryable: false,
+    };
+  }
+
+  if (detail.includes("429") || detail.includes("rate limit")) {
+    return {
+      code: "RATE_LIMITED",
+      message: "WHOOP is rate limiting requests. Try again later.",
+      retryable: true,
+    };
+  }
+
+  if (
+    detail.includes("abort") ||
+    detail.includes("timed out") ||
+    detail.includes("timeout")
+  ) {
+    return {
+      code: "UPSTREAM_TIMEOUT",
+      message: "WHOOP did not respond before the request timeout.",
+      retryable: true,
+    };
+  }
+
+  if (
+    detail.includes("network") ||
+    detail.includes("fetch failed") ||
+    /\b5\d{2}\b/.test(detail)
+  ) {
+    return {
+      code: "UPSTREAM_UNAVAILABLE",
+      message: "WHOOP is temporarily unavailable.",
+      retryable: true,
+    };
+  }
+
+  return {
+    code: "TEMPORARY_FAILURE",
+    message: "The request could not be completed.",
+    retryable: true,
+  };
+}
 
 export interface ToolDefinition<I extends Shape, O extends Shape> {
   title: string;
@@ -52,17 +171,27 @@ export function defineTool<I extends Shape, O extends Shape>(
       const output = await handler(args);
       return {
         structuredContent: output as Record<string, unknown>,
-        content: [{ type: "text", text: JSON.stringify(output, null, 2) }],
+        content: [
+          { type: "text", text: JSON.stringify(output) },
+          { type: "text", text: WELLNESS_NOTICE },
+        ],
       };
     } catch (err) {
-      // Log the full detail server-side only. The upstream message can embed the raw
-      // WHOOP response body ("Whoop API error <status> on <endpoint>: <body>"); return
-      // a generic message to the client so no upstream detail leaks to the LLM.
-      const detail = err instanceof Error ? err.message : String(err);
-      console.error(`[tool:${name}] error ${def.errorLabel}:`, detail);
+      // Do not log an upstream response body: it may contain health information.
+      // Clients receive a stable, privacy-safe category and can decide whether to retry.
+      const safeError = classifyToolError(err);
+      console.error(`[tool:${name}] ${safeError.code} while ${def.errorLabel}`);
       return {
         isError: true,
-        content: [{ type: "text", text: `Failed while ${def.errorLabel}. See server logs.` }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error: safeError,
+              wellness_notice: WELLNESS_NOTICE,
+            }),
+          },
+        ],
       };
     }
   };
@@ -71,11 +200,11 @@ export function defineTool<I extends Shape, O extends Shape>(
     name,
     {
       title: def.title,
-      description: def.description,
-      inputSchema: def.inputSchema,
-      outputSchema: def.outputSchema,
+      description: `${def.description} ${WELLNESS_NOTICE}`,
+      inputSchema: z.object(def.inputSchema),
+      outputSchema: z.object(def.outputSchema),
       annotations: def.annotations,
     },
-    cb as unknown as ToolCallback<I>,
+    cb,
   );
 }

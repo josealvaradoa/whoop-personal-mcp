@@ -1,243 +1,210 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import {
+  createMcpHandler,
+  isJSONRPCRequest,
+  McpServer,
+  type McpHttpHandler,
+  type OAuthTokenVerifier,
+} from "@modelcontextprotocol/server";
+import {
+  getOAuthProtectedResourceMetadataUrl,
+  requireBearerAuth,
+} from "@modelcontextprotocol/express";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 import type { Express, Request, Response } from "express";
-import { randomUUID } from "node:crypto";
-import type { OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import { registerOverviewTool } from "./tools/overview.js";
 import { registerRecoveryTool } from "./tools/recovery.js";
 import { registerHrvTool } from "./tools/hrv.js";
 import { registerSleepTool } from "./tools/sleep.js";
 import { registerTrainingLoadTool } from "./tools/training-load.js";
 import { registerWorkoutsTool } from "./tools/workouts.js";
-import { registerRaceReadinessTool } from "./tools/race-readiness.js";
+import { registerEventContextTool } from "./tools/race-readiness.js";
+import { registerWellnessContextPrompt } from "./prompts/wellness-context.js";
+import { registerUsagePolicyResource } from "./resources/usage-policy.js";
+import { config } from "../config.js";
 
-const MAX_SESSIONS = 10;
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const MODERN_PROTOCOL_VERSION = "2026-07-28";
 
-interface Session {
-  transport: StreamableHTTPServerTransport;
-  server: McpServer;
-  lastActivity: number;
-  // Number of requests currently being served by this session. A session is never
-  // evicted (LRU) or swept (idle timeout) while a request is in flight, so a
-  // long-running WHOOP call cannot have its transport torn down mid-request.
-  inFlight: number;
+export interface McpRuntime {
+  /**
+   * Abort exchanges that started before this call and rotate to a fresh
+   * stateless handler. Used by the protected disconnect/privacy-wipe route.
+   */
+  closeAllSessions(): Promise<void>;
+  /** Permanently stop the MCP handler and abort its in-flight exchanges. */
+  close(): Promise<void>;
 }
 
 function createMcpServer(): McpServer {
   const server = new McpServer({
-    name: "whoop-mcp-server",
+    name: "whoop-personal-mcp",
     version: "1.0.0",
   });
 
+  // Registration order is deliberately stable. MCP 2026-07-28 requires tool
+  // lists to be deterministic, and the same factory serves both protocol eras.
   registerOverviewTool(server);
   registerRecoveryTool(server);
   registerHrvTool(server);
   registerSleepTool(server);
   registerTrainingLoadTool(server);
   registerWorkoutsTool(server);
-  registerRaceReadinessTool(server);
+  if (config.event) registerEventContextTool(server);
+  registerWellnessContextPrompt(server);
+  registerUsagePolicyResource(server);
 
   return server;
 }
 
-function isInitializeRequest(body: unknown): boolean {
-  if (Array.isArray(body)) {
-    return body.some((m: { method?: string }) => m.method === "initialize");
-  }
-  return (body as { method?: string })?.method === "initialize";
+function createHandler(): McpHttpHandler {
+  return createMcpHandler(createMcpServer, {
+    // The modern leg speaks MCP 2026-07-28 (server/discover plus a per-request
+    // _meta envelope). The official SDK's stateless fallback keeps conforming
+    // 2024/2025 clients working without carrying protocol sessions forward.
+    legacy: "stateless",
+    responseMode: "auto",
+    onerror(error) {
+      // Do not log request bodies or tool results: either may contain personal
+      // wellness data. The error class is enough for operational diagnosis.
+      console.error(`[mcp] request failed (${error.name})`);
+    },
+  });
 }
 
-export function mountMcp(app: Express, provider: OAuthServerProvider): void {
-  const auth = requireBearerAuth({ verifier: provider });
-  const sessions = new Map<string, Session>();
+function modernRequestIdMissingProtocolHeader(
+  req: Request,
+): string | number | undefined {
+  const body = req.body;
+  // Let the SDK classify malformed JSON-RPC itself so invalid ids, protocol
+  // versions, or method shapes retain the standard -32600 response rather
+  // than being misreported as an HTTP routing-header mismatch.
+  if (!isJSONRPCRequest(body)) return undefined;
+  const params = "params" in body ? body.params : undefined;
+  if (params === null || typeof params !== "object" || Array.isArray(params)) return undefined;
+  const meta = "_meta" in params ? params._meta : undefined;
+  if (meta === null || typeof meta !== "object" || Array.isArray(meta)) return undefined;
+  const claimedVersion = "io.modelcontextprotocol/protocolVersion" in meta
+    ? meta["io.modelcontextprotocol/protocolVersion"]
+    : undefined;
+  if (claimedVersion !== MODERN_PROTOCOL_VERSION) return undefined;
+  const header = req.headers["mcp-protocol-version"];
+  if (typeof header === "string" && header.trim() !== "") return undefined;
 
-  // Evict expired sessions every 5 minutes. Skip sessions with an in-flight
-  // request so a slow WHOOP call is never torn down out from under itself.
-  setInterval(() => {
-    const now = Date.now();
-    for (const [id, session] of sessions) {
-      if (session.inFlight === 0 && now - session.lastActivity > SESSION_TIMEOUT_MS) {
-        console.log(`Session ${id} timed out, closing`);
-        session.transport.close();
-        session.server.close();
-        sessions.delete(id);
-      }
-    }
-  }, CLEANUP_INTERVAL_MS);
+  return body.id;
+}
 
-  // Evict the least-recently-active *idle* session. Returns true if one was
-  // evicted, false if every session is currently in flight (caller should then
-  // refuse the new session rather than tear down a busy one). The entry is
-  // removed from the map before awaiting close() so a concurrent request can
-  // never route to a session that is mid-teardown.
-  async function evictOldest(): Promise<boolean> {
-    let oldestId: string | null = null;
-    let oldestTime = Infinity;
-    for (const [id, session] of sessions) {
-      if (session.inFlight > 0) continue; // never evict a session with a live request
-      if (session.lastActivity < oldestTime) {
-        oldestTime = session.lastActivity;
-        oldestId = id;
-      }
-    }
-    if (!oldestId) return false; // all sessions busy
-    const old = sessions.get(oldestId)!;
-    console.log(`Evicting oldest session ${oldestId}`);
-    sessions.delete(oldestId);
-    await old.transport.close();
-    await old.server.close();
-    return true;
-  }
+/**
+ * Mount a single Streamable HTTP endpoint that serves both MCP protocol eras:
+ * modern 2026-07-28 traffic and the SDK's stateless 2025-era compatibility
+ * path. The handler factory creates a fresh McpServer for every HTTP exchange.
+ */
+export function mountMcp(app: Express, provider: OAuthTokenVerifier): McpRuntime {
+  const resourceServerUrl = new URL("/mcp", config.server.publicUrl);
+  const auth = requireBearerAuth({
+    verifier: provider,
+    requiredScopes: ["mcp:read"],
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
+  });
 
-  // POST /mcp — JSON-RPC requests
-  app.post("/mcp", auth, async (req: Request, res: Response) => {
-    try {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const method = (req.body as { method?: string })?.method ?? (Array.isArray(req.body) ? "batch" : "unknown");
-    console.log(`[mcp] POST /mcp — sessionId=${sessionId?.slice(0, 8) ?? "none"}…, method=${method}, active=${sessions.size}`);
+  let closed = false;
+  let handler = createHandler();
+  let nodeHandler = toNodeHandler(handler, {
+    onerror(error) {
+      console.error(`[mcp] HTTP adapter failed (${error.name})`);
+    },
+  });
+  const activeResponses = new Set<Response>();
 
-    // Route to existing session
-    if (sessionId && sessions.has(sessionId)) {
-      const session = sessions.get(sessionId)!;
-      session.lastActivity = Date.now();
-      // Mark in-flight for the whole request so eviction/sweep skip this session,
-      // and refresh lastActivity on completion so a long call isn't "oldest".
-      session.inFlight++;
-      try {
-        await session.transport.handleRequest(req, res, req.body);
-      } finally {
-        session.inFlight--;
-        session.lastActivity = Date.now();
-      }
-      return;
-    }
-
-    // Stale/unknown session ID → 404 per MCP Streamable HTTP spec
-    if (sessionId && !sessions.has(sessionId)) {
-      res.status(404).json({
+  app.all("/mcp", auth, (req: Request, res: Response) => {
+    if (closed) {
+      res.status(503).json({
         jsonrpc: "2.0",
-        error: { code: -32001, message: "Session not found" },
+        error: { code: -32603, message: "MCP server is shutting down" },
         id: null,
       });
       return;
     }
 
-    // No session ID + not an initialize request → 400
-    if (!isInitializeRequest(req.body)) {
-      console.error(`[mcp] REJECTED — sessionId=${sessionId ? `${sessionId.slice(0, 8)}… NOT FOUND` : "missing"}, method=${method} is not initialize`);
+    // SDK 2.0.0 validates protocol-header/body disagreement but its initial
+    // release does not reject an absent MCP-Protocol-Version header. The final
+    // 2026-07-28 transport rules require it on every modern request POST, so
+    // close that narrow conformance gap before dispatch. Notifications remain
+    // exempt because their header requirements are intentionally unspecified.
+    const missingProtocolHeaderId = modernRequestIdMissingProtocolHeader(req);
+    if (missingProtocolHeaderId !== undefined) {
       res.status(400).json({
         jsonrpc: "2.0",
         error: {
-          code: -32000,
-          message: "Bad Request: No valid session. Send an initialize request first.",
+          code: -32020,
+          message:
+            "Bad Request: the required MCP-Protocol-Version header is absent",
+          data: {
+            mismatch: {
+              header: "(missing)",
+              body: `the request envelope names ${MODERN_PROTOCOL_VERSION}`,
+            },
+          },
         },
-        id: null,
+        id: missingProtocolHeaderId,
       });
       return;
     }
 
-    // Enforce session cap with LRU eviction. If every existing session is busy
-    // serving a request, refuse the new one (503) rather than evict a live one.
-    if (sessions.size >= MAX_SESSIONS) {
-      const evicted = await evictOldest();
-      if (!evicted) {
-        console.error(`[mcp] REJECTED initialize — all ${MAX_SESSIONS} sessions are busy`);
-        res.status(503).json({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Server busy: maximum concurrent sessions reached. Please retry shortly.",
-          },
-          id: (req.body as { id?: string | number | null })?.id ?? null,
-        });
-        return;
-      }
-    }
+    activeResponses.add(res);
+    const currentNodeHandler = nodeHandler;
+    void currentNodeHandler(req, res, req.body)
+      .catch((error: unknown) => {
+        console.error(
+          `[mcp] request adapter rejected (${error instanceof Error ? error.name : "unknown"})`,
+        );
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: "2.0",
+            error: { code: -32603, message: "Internal server error" },
+            id: null,
+          });
+        }
+      })
+      .finally(() => {
+        activeResponses.delete(res);
+      });
+  });
 
-    // Create new session
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
+  const closeAllSessions = async (): Promise<void> => {
+    if (closed) return;
+
+    // Swap synchronously so requests arriving while the previous generation is
+    // closing use a clean handler. Then terminate any old HTTP response streams
+    // and let the SDK close every modern per-request server instance.
+    const previous = handler;
+    const previousResponses = [...activeResponses];
+    handler = createHandler();
+    nodeHandler = toNodeHandler(handler, {
+      onerror(error) {
+        console.error(`[mcp] HTTP adapter failed (${error.name})`);
+      },
     });
 
-    const mcpServer = createMcpServer();
-
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-      }
-    };
-
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-
-    // Session ID is assigned during handleRequest (on initialize)
-    if (transport.sessionId) {
-      sessions.set(transport.sessionId, {
-        transport,
-        server: mcpServer,
-        lastActivity: Date.now(),
-        inFlight: 0,
-      });
-      console.log(`New MCP session: ${transport.sessionId} (active: ${sessions.size})`);
-    } else {
-      // initialize returned without assigning a session id → nothing tracks this
-      // connected transport/server pair, so close both to avoid leaking them.
-      console.error(`[mcp] initialize did not assign a session id — closing orphaned transport/server`);
-      await transport.close();
-      await mcpServer.close();
+    for (const response of previousResponses) {
+      if (!response.writableEnded && !response.destroyed) response.destroy();
     }
-    } catch (err) {
-      // Log the detail server-side; return only a generic message to the client.
-      console.error("POST /mcp error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
-      }
-    }
-  });
+    await previous.close();
+  };
 
-  // GET /mcp — SSE stream for server-to-client notifications
-  app.get("/mcp", auth, async (req: Request, res: Response) => {
-    try {
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      if (!sessionId || !sessions.has(sessionId)) {
-        res.status(404).json({ error: "Session not found" });
-        return;
+  const runtime: McpRuntime = {
+    closeAllSessions,
+    async close() {
+      if (closed) return;
+      closed = true;
+      for (const response of activeResponses) {
+        if (!response.writableEnded && !response.destroyed) response.destroy();
       }
-      const session = sessions.get(sessionId)!;
-      session.lastActivity = Date.now();
-      await session.transport.handleRequest(req, res);
-    } catch (err) {
-      // Log the detail server-side; return only a generic message to the client.
-      console.error("GET /mcp error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Internal server error" });
-      }
-    }
-  });
+      activeResponses.clear();
+      await handler.close();
+    },
+  };
 
-  // DELETE /mcp — close a session
-  app.delete("/mcp", auth, async (req: Request, res: Response) => {
-    try {
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      if (!sessionId || !sessions.has(sessionId)) {
-        res.status(404).json({ error: "Session not found" });
-        return;
-      }
-      const session = sessions.get(sessionId)!;
-      sessions.delete(sessionId); // drop from the map before awaiting close()
-      await session.transport.close();
-      await session.server.close();
-      console.log(`Session ${sessionId} closed (active: ${sessions.size})`);
-      res.status(200).json({ status: "session closed" });
-    } catch (err) {
-      // Log the detail server-side; return only a generic message to the client.
-      console.error("DELETE /mcp error:", err);
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Internal server error" });
-      }
-    }
-  });
+  // The protected disconnect route uses this hook to terminate open exchanges
+  // immediately after revoking persisted credentials.
+  app.locals.closeMcpSessions = closeAllSessions;
+  return runtime;
 }

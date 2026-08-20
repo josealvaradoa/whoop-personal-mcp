@@ -1,14 +1,20 @@
 import { describe, it, expect } from "vitest";
 import {
   isScoredRecovery,
+  cycleDateMap,
   toDailyRecovery,
-  getReadiness,
-  getRecommendation,
+  getRecoveryBand,
   computeTrend,
   computeRecoveryTrend,
   computeBaselineComparison,
 } from "../../src/compute/recovery.js";
-import { makeRecovery, consecutiveRecovery, makeDailyRecovery, shiftDay } from "../helpers/fixtures.js";
+import {
+  makeCycle,
+  makeRecovery,
+  consecutiveRecovery,
+  makeDailyRecovery,
+  shiftDay,
+} from "../helpers/fixtures.js";
 
 const D = "2026-06-15";
 
@@ -21,6 +27,14 @@ describe("isScoredRecovery", () => {
 });
 
 describe("toDailyRecovery (mirrors how tools build DailyRecovery via a cycle-idâ†’date map)", () => {
+  it("builds cycle dates in the configured owner timezone", () => {
+    const cycle = {
+      ...makeCycle({ date: "2026-06-15", id: 7 }),
+      start: "2026-06-15T01:00:00.000Z",
+    };
+    expect(cycleDateMap([cycle], "America/New_York").get(7)).toBe("2026-06-14");
+  });
+
   it("keeps only scored records whose cycle_id is dated, mapping via the cycle map", () => {
     const cycleDates = new Map([
       [1, "2026-06-10"],
@@ -45,19 +59,14 @@ describe("toDailyRecovery (mirrors how tools build DailyRecovery via a cycle-idâ
   });
 });
 
-describe("getReadiness / getRecommendation (thresholds red 33, yellow 66)", () => {
-  it("maps recovery score to readiness bands (boundaries inclusive)", () => {
-    expect(getReadiness(80)).toBe("green");
-    expect(getReadiness(66)).toBe("green");
-    expect(getReadiness(65)).toBe("yellow");
-    expect(getReadiness(33)).toBe("yellow");
-    expect(getReadiness(32)).toBe("red");
-    expect(getReadiness(0)).toBe("red");
-  });
-  it("maps readiness to a recommendation", () => {
-    expect(getRecommendation("green")).toBe("full_training");
-    expect(getRecommendation("yellow")).toBe("reduced_intensity");
-    expect(getRecommendation("red")).toBe("active_recovery_only");
+describe("getRecoveryBand (WHOOP product boundaries)", () => {
+  it("maps exactly 0-33 red, 34-66 yellow, and 67-100 green", () => {
+    expect(getRecoveryBand(0)).toBe("red");
+    expect(getRecoveryBand(33)).toBe("red");
+    expect(getRecoveryBand(34)).toBe("yellow");
+    expect(getRecoveryBand(66)).toBe("yellow");
+    expect(getRecoveryBand(67)).toBe("green");
+    expect(getRecoveryBand(100)).toBe("green");
   });
 });
 
@@ -84,6 +93,8 @@ describe("computeRecoveryTrend", () => {
       consecutive_red_days: 0,
       consecutive_yellow_days: 0,
       consecutive_green_days: 0,
+      days_with_data_7d: 0,
+      days_with_data_30d: 0,
       as_of_date: null,
     });
   });
@@ -96,7 +107,9 @@ describe("computeRecoveryTrend", () => {
     expect(r.consecutive_yellow_days).toBe(0);
     expect(r.consecutive_red_days).toBe(0);
     expect(r.avg_7d).toBe(68); // round(mean([70,68,40,80,80]))
-    expect(r.trend).toBe("stable");
+    expect(r.trend).toBeNull(); // fewer than 14 observations in the 30-day window
+    expect(r.days_with_data_7d).toBe(5);
+    expect(r.days_with_data_30d).toBe(5);
   });
 
   it("counts a red streak (feeds the consecutive-red alert)", () => {
@@ -107,7 +120,7 @@ describe("computeRecoveryTrend", () => {
 
   it("does NOT count calendar-gapped red readings as a streak (fix 2)", () => {
     // Three red readings scattered over 11 days (D, D-5, D-10) are NOT a 3-day streak;
-    // a gap after the newest day ends it. This is the false-critical-fatigue bug.
+    // a gap after the newest day ends it, so it cannot masquerade as repeated daily red bands.
     const daily = [
       makeDailyRecovery({ date: D, recoveryScore: 20 }),
       makeDailyRecovery({ date: shiftDay(D, -5), recoveryScore: 25 }),
