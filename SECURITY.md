@@ -1,53 +1,261 @@
-# Security
+# Security policy and operating model
 
-This document describes the security model of `whoop-ironman-mcp` and how to report a vulnerability. The project went through a full manual security audit; several of the measures below were added as a direct result.
+WHOOP Personal MCP is a personal, self-hosted service for one owner and one
+linked WHOOP account. The same owner may authorize several trusted clients, but
+the server has no isolation between people. Never use one instance for a team,
+patients, employees, customers, research participants, or any other multi-user
+case.
 
-## Design: single-tenant by design
+This document describes design controls and operator responsibilities. It is not
+a security certification, penetration-test report, compliance attestation, or
+guarantee. The project has not been independently certified.
 
-The server is built for **one WHOOP account per deployment**. WHOOP tokens live in a single-row table (`tokens`, `id = 1`), so there is exactly one linked account at a time. It is meant to be self-hosted by the athlete whose data it serves — it is not a multi-user SaaS, and it does not try to isolate multiple users.
+## Report a vulnerability
 
-Because a linked account is a shared, overwritable resource, both "who can talk to the MCP server" and "who can link/relink WHOOP" are gated behind a single secret you control: `ACCESS_PASSWORD`.
+Report a sensitive issue privately through
+[GitHub Security Advisories](https://github.com/josealvaradoa/whoop-personal-mcp/security/advisories/new).
+Do not include a real database, environment file, credentials, authorization
+code, bearer token, or personal wellness data. Include affected versions,
+reproduction steps using synthetic data, impact, and any suggested mitigation.
 
-## The consent gate (and the attack it closes)
+Use a public [GitHub issue](https://github.com/josealvaradoa/whoop-personal-mcp/issues)
+only for non-sensitive bugs. There is no guaranteed response time, support SLA,
+or dedicated security mailbox. If a live credential may be exposed, rotate or
+revoke it immediately rather than waiting for a maintainer response.
 
-**Before:** if a WHOOP account was linked, the OAuth `authorize` endpoint immediately issued an authorization code to *any* client that asked. Combined with open dynamic client registration, anyone who knew the server URL could register a client, get auto-approved, exchange a token, and read your recovery, sleep, HRV, and workout history — with no authentication and no consent step.
+## Trust boundaries
 
-**Now:** `authorize` never auto-approves. It renders a browser consent page that requires `ACCESS_PASSWORD` before any authorization code is issued. The same password gates `/auth/whoop`, so a stranger cannot link or overwrite the linked WHOOP account either. The password is verified with a timing-safe comparison, and pending consent requests are single-use with a short TTL.
+The normal path is WHOOP → the owner's deployment → the chosen MCP client/AI
+provider. Repository maintainers receive no traffic or telemetry. That does not
+make the system local-only: the hosting provider can access infrastructure
+traffic, memory, logs, and volumes, while an authorized MCP client/model provider
+receives requested tool results under its own policies.
 
-## Phishing the consent gate (and how it's mitigated)
+The design trusts:
 
-**The attack:** the consent page asks the owner for `ACCESS_PASSWORD`. Because dynamic client registration is open, an attacker could register a client named "Claude" whose `redirect_uri` points at *their own* callback, send the owner the resulting `/authorize` link, and — if the owner typed their password — receive an authorization code at the attacker's domain. The consent page previously showed only the attacker-chosen client name, not the destination, so nothing tipped off the owner.
+- the operator, host, image/source, and dependency supply chain;
+- the secrecy of <code>WHOOP_CLIENT_SECRET</code>,
+  <code>ENCRYPTION_SECRET</code>, <code>ACCESS_PASSWORD</code>, and any static
+  bearer token;
+- the HTTPS ingress and DNS for <code>PUBLIC_URL</code>;
+- the exact OAuth callback hosts the operator allows; and
+- every MCP client and AI provider the owner authorizes.
 
-**Two mitigations, both required:**
+Compromise of the host process, operator account, secret store, reverse proxy,
+authorized client, or model-provider account is outside what application-level
+database encryption can contain.
 
-- **Registration redirect-host allowlist.** Registration now accepts a `redirect_uri` only when it is https *and* its hostname **exactly** equals an allowed host. The defaults are the Claude hosts (`claude.ai`, `claude.com`, `www.claude.ai`, `www.claude.com`); `ALLOWED_REDIRECT_HOSTS` (comma-separated) replaces that remote list when set. Matching is exact — no suffix/substring logic — so `claude.ai.evil.com` and `sub.claude.ai.evil.com` are rejected. `localhost`/`127.0.0.1` stay allowed (http included) for local development. This keeps registration open for the real Claude while denying an attacker a callback on their own domain.
-- **Consent-page destination transparency.** The consent page now also renders the concrete `redirect_uri` host ("This will send your data to: `<host>`", HTML-escaped), so the owner sees where an approval would send data before typing the password.
+## Authentication boundaries
 
-**Tradeoff:** the allowlist is a deny-by-default policy. Self-hosters who connect a non-Claude MCP client (or a custom callback host) must add their host to `ALLOWED_REDIRECT_HOSTS`; otherwise registration is rejected. This is the intended default — open registration limited to hosts you trust.
+### WHOOP account authorization
 
-## Rate limiting the password endpoints
+<code>ACCESS_PASSWORD</code> and an explicit wellness-only acknowledgment gate
+the browser flow that links WHOOP. The server requests only
+<code>read:recovery</code>, <code>read:cycles</code>,
+<code>read:sleep</code>, <code>read:workout</code>, and
+<code>offline</code>. It never receives the owner's WHOOP password.
 
-The two browser password endpoints (`POST /auth/consent`, `POST /auth/whoop`) enforce a small in-memory, per-IP failed-attempt limit: after 5 wrong `ACCESS_PASSWORD` submissions from one IP within 15 minutes, further attempts get `429` with a `Retry-After` until the window elapses; a correct password resets that IP's counter. This throttles online brute-forcing of `ACCESS_PASSWORD`. It is best-effort (in-memory, resets on restart, keyed on `req.ip` behind `trust proxy`), not a substitute for a strong password.
+The instance refuses to silently overwrite an already linked account. A valid
+MCP bearer plus the owner <code>ACCESS_PASSWORD</code> is required to call
+<code>POST /auth/disconnect</code> before a new account can be linked. An
+ordinary client bearer alone is intentionally not an administrative wipe
+credential.
 
-## Data protection
+### MCP client authorization
 
-- **WHOOP tokens are encrypted at rest** with AES-256-GCM. The key is derived from `ENCRYPTION_SECRET` via PBKDF2 (100,000 iterations, SHA-256), with a random 16-byte salt and 12-byte IV generated per encryption and a GCM authentication tag.
-- **MCP access/refresh tokens are stored as SHA-256 hashes.** The raw token is only ever returned to the client that owns it; incoming tokens are hashed before lookup. A database leak therefore yields no usable MCP credentials.
-- **Timing-safe secret comparisons.** `ACCESS_PASSWORD`, the static bearer token, and MCP tokens are compared with `crypto.timingSafeEqual` over SHA-256 digests (equal-length buffers, input length hidden).
-- **Redirect-host allowlist (https-only).** Dynamic client registration accepts a `redirect_uri` only when it is https and its hostname exactly matches an allowed host (see "Phishing the consent gate" above); plain HTTP is allowed only for `localhost` / `127.0.0.1`. Authorization codes can therefore only be delivered over TLS to a trusted host.
-- **Authorization-code binding and TTL.** MCP authorization codes carry the `redirect_uri` they were issued for and are bound to it at token exchange (the incoming `redirect_uri` must be present and equal). Codes expire 5 minutes after issue, enforced at exchange rather than only by the periodic sweep.
-- **CORS allowlist.** Origins are reflected only for an allowlist — `claude.ai`, `claude.com`, any `localhost`/`127.0.0.1`, plus anything you add via `CORS_ORIGINS` — instead of a blanket wildcard.
-- **Refresh-token hygiene.** MCP refresh tokens rotate on use (old token deleted, new one issued). WHOOP refresh tokens are single-use, so refreshes are serialized behind a single-flight mutex to avoid races.
-- **Secrets are never logged** — only short, non-reversible prefixes appear in logs. `.env`, `whoop-mcp.config.json`, and `data/` are gitignored.
+The authorization server prefers Client ID Metadata Documents (CIMD) and keeps
+Dynamic Client Registration (DCR) as a backwards-compatible fallback. MCP
+<code>2026-07-28</code> deprecates DCR, but does not remove it. Neither path
+auto-approves a client. The owner sees the concrete client and redirect
+destination, enters <code>ACCESS_PASSWORD</code>, and acknowledges the wellness
+limit before an authorization code is issued.
 
-## Threat model (honest version)
+Remote callback URIs must use HTTPS and exactly match a hostname in
+<code>ALLOWED_REDIRECT_HOSTS</code>. Loopback HTTP/HTTPS is allowed for local
+clients. Exact matching prevents lookalike suffixes such as
+<code>trusted.example.attacker.example</code>. No remote callback host is allowed
+by default; loopback is the only implicit exception. Add only an exact callback
+that you verified with the client provider.
 
-The consent gate and encryption assume `ACCESS_PASSWORD` and `ENCRYPTION_SECRET` stay secret and that you deploy over HTTPS. Anyone who knows `ACCESS_PASSWORD` can link WHOOP and connect a client — that is the intended trust boundary, so choose a strong value and rotate it if exposed. If `MCP_BEARER_TOKEN` is set, it is a long-lived credential that never effectively expires and has no consent step (its `expiresAt` is refreshed on every request so the SDK accepts it); leave it unset in production unless you specifically need the curl/script path. This is a single-tenant personal tool, not a hardened multi-tenant service: rate limiting is limited to the browser password endpoints (a best-effort per-IP throttle), and there is no account isolation and no audit log beyond application logs.
+### CIMD outbound-fetch boundary
 
-## Reporting a vulnerability
+CIMD requires this authorization server to retrieve a client-hosted metadata
+document, which creates an unavoidable server-side request-forgery (SSRF)
+surface. The implementation accepts only HTTPS client IDs with a non-root path
+and no credentials, query, fragment, or dot segments. It rejects local/internal
+host suffixes, resolves DNS before connecting, rejects any private, reserved,
+link-local, loopback, multicast, documentation, or IPv4-mapped destination,
+pins the vetted address for the connection, keeps TLS certificate/hostname
+verification, and does not follow redirects.
 
-Please report security issues privately via **GitHub Security Advisories** on the repository (Security → Report a vulnerability), or by opening a GitHub issue if the matter is not sensitive:
+Fetches have a five-second timeout, JSON media-type requirement, 5 KiB body
+limit, and bounded in-flight/cache counts. A document is cached only when its
+HTTP response explicitly permits caching; the lifetime is capped at ten
+minutes. The document's <code>client_id</code> must byte-match its URL, and its
+name, public-client authentication method, grants, response type, application
+type, and 1–20 redirect URIs are validated. Every redirect also passes the same
+owner allowlist used by DCR.
 
-<https://github.com/josealvaradoa/whoop-mcp-openclaw>
+These application checks are defense in depth, not a substitute for host-level
+egress policy. A production operator should deny private/control-plane networks
+at the network layer and allow only the outbound destinations the deployment
+needs. DCR remains available for clients that cannot publish CIMD and therefore
+does not use this outbound fetch path.
 
-There is no dedicated security contact address for this project; please use the GitHub channels above.
+Authorization codes expire after five minutes and are bound to the validated
+redirect URI and PKCE challenge. Issued MCP access tokens expire after one
+hour. A client receives a refresh token only when its validated metadata
+declares the <code>refresh_token</code> grant; those tokens expire after 30 days
+and rotate on use. Raw issued tokens
+are returned only to the client; SHA-256 hashes are stored in SQLite.
+
+The protected-resource metadata, authorization-server metadata, and bearer
+challenge advertise the minimal <code>mcp:read</code> scope. An OAuth
+<code>resource</code> value, when supplied, must exactly identify this
+deployment's canonical <code>/mcp</code> resource. Issued opaque tokens are
+accepted only by the local deployment that minted them.
+
+The authorization server advertises RFC 9207 support and includes an exact
+<code>iss</code> issuer value on successful and terminal-error redirects to the
+already validated client URI. A conforming client validates that value against
+the issuer it discovered before redeeming a code. This limits
+authorization-server mix-up attacks; it does not make a malicious client or
+redirect destination safe.
+
+The optional <code>MCP_BEARER_TOKEN</code> is intentionally long-lived and has
+the same read access without browser consent or per-client revocation. Leave it
+unset for OAuth-capable clients. If enabled, generate a high-entropy value, give
+it to the minimum number of clients, and rotate it after any possible exposure.
+
+## Request and browser controls
+
+The <code>/mcp</code> transport requires a valid bearer token. It also rejects:
+
+- an unexpected HTTP Host, using <code>PUBLIC_URL</code> plus
+  <code>ALLOWED_HOSTS</code>; and
+- an unexpected browser Origin, using <code>PUBLIC_URL</code> plus the explicit
+  <code>CORS_ORIGINS</code> allowlist.
+
+These checks reduce DNS-rebinding and cross-origin browser risk but do not
+replace a correctly configured edge proxy. The proxy must preserve Host,
+Authorization, <code>MCP-Protocol-Version</code>, <code>Mcp-Method</code>, and
+<code>Mcp-Name</code> when present, and terminate trusted HTTPS.
+
+Native MCP <code>2026-07-28</code> requests are stateless. The SDK checks the
+per-request protocol/capability envelope against the HTTP protocol and routing
+headers. The 2025-era compatibility path is also stateless: it accepts the
+legacy initialization lifecycle but does not issue or trust an
+<code>Mcp-Session-Id</code>. GET streams and DELETE session teardown are not
+exposed.
+
+Password submissions use timing-safe comparisons and a best-effort in-memory,
+per-IP throttle: five failed attempts in 15 minutes cause a temporary lockout.
+It resets on process restart and depends on correct proxy/IP handling, so apply
+edge rate limits as appropriate. Pending consent/WHOOP states are bounded,
+single-use where applicable, and expire. Dynamic client records are capped, and
+in-flight MCP work is bounded by the HTTP/runtime limits, but these controls are
+not comprehensive DDoS protection.
+
+## Data at rest
+
+The persistent SQLite volume contains one account's state:
+
+- WHOOP access/refresh tokens encrypted with AES-256-GCM;
+- a per-encryption random salt/IV and authentication tag, with a key derived
+  from <code>ENCRYPTION_SECRET</code> using PBKDF2-SHA-256;
+- DCR client metadata; and
+- hashes/expiration times for issued MCP access and refresh tokens.
+
+The application does not persist WHOOP API responses, MCP tool results, prompts,
+or AI/model responses. WHOOP records exist in process memory only while a tool
+request is fetched, calculated, and returned. A host, proxy, client, or model
+provider can still create its own logs or retained copies.
+
+SQLite uses WAL mode and secure deletion, but filesystems, WAL pages, storage
+snapshots, host backups, and deleted blocks can outlive a logical row. Encrypt
+and access-control the volume and backups. Store
+<code>ENCRYPTION_SECRET</code> separately; losing it makes the encrypted state
+unreadable, while losing it together with the database exposes that state to
+offline attack.
+
+Application logs avoid raw tokens, upstream response bodies, and tool payloads.
+This cannot control logs added by a reverse proxy, platform, client, or future
+operator instrumentation. Treat all logs and crash artifacts as potentially
+sensitive and review changes before deploying.
+
+## Disconnect and incident response
+
+An owner-confirmed <code>POST /auth/disconnect</code> invalidates local WHOOP
+token state, DCR clients, and issued MCP token hashes immediately and
+stops active MCP work/response streams, then awaits best-effort remote WHOOP
+revocation. Local
+deletion therefore does not wait on WHOOP and proceeds even if revocation fails.
+The response tells the
+caller whether remote revocation succeeded.
+If stored WHOOP credentials cannot be decrypted, the response reports remote
+revocation as <code>unavailable</code> rather than claiming it was unnecessary;
+the owner must then revoke the integration directly in WHOOP.
+
+Disconnect does not delete:
+
+- backups or snapshots managed by the operator/host;
+- conversation history or copies held by an MCP client/AI provider; or
+- an environment-provided static bearer token.
+
+After suspected compromise: stop public access, disconnect/revoke WHOOP, rotate
+the WHOOP app secret if necessary, rotate all deployment secrets, remove old
+volumes/backups according to policy, invalidate provider sessions, and inspect
+the host/source/dependencies before redeploying. Changing
+<code>ENCRYPTION_SECRET</code> does not re-encrypt existing rows; disconnect or
+relink using a clean database when rotating it.
+
+## Production checklist
+
+- Use the owner's own WHOOP Developer app/credentials and review the current
+  [WHOOP API Terms of Use](https://developer.whoop.com/api-terms-of-use/).
+- Obtain explicit owner consent before any tool output is disclosed to an MCP
+  client or AI provider.
+- Use a reviewed tag/commit and locked dependencies.
+- Run one replica with a private persistent volume; never share its SQLite
+  directory between active instances.
+- Use a stable HTTPS origin and register the exact WHOOP callback.
+- Generate independent, high-entropy secrets and store them in the platform's
+  secret manager.
+- Leave static bearer auth disabled unless required.
+- Keep redirect, Host, CORS, firewall, and proxy allowlists narrow; never use a
+  wildcard to suppress an OAuth error.
+- Run the image as its non-root user where the platform supports volume
+  ownership, with a read-only root filesystem and minimal capabilities.
+- Restrict platform/project access, logs, backups, shells, and volume exports.
+- Keep Node, the base image, dependencies, client, and ingress patched.
+- Monitor authentication failures and resource use without recording wellness
+  payloads or credentials.
+- Do not add WHOOP-response/tool-result persistence; disable payload capture in
+  the host, proxy, and observability stack.
+- Test backup restoration and the disconnect procedure with synthetic data.
+- On termination, disconnect/revoke WHOOP and delete the local volume, backups,
+  client/provider records, and credentials as applicable.
+- Re-read [PRIVACY.md](PRIVACY.md) and [DISCLAIMER.md](DISCLAIMER.md), including
+  provider retention and non-HIPAA scope.
+
+## Known limitations
+
+- No multi-user isolation, role-based access control, per-tool client policy, or
+  administrator audit trail.
+- No built-in TLS termination, firewall, distributed rate limiter, secret
+  rotation service, or automated backup system.
+- In-memory pending OAuth/consent state and the local SQLite authorization store
+  require one active replica. The MCP 2026 transport itself is stateless, but
+  that does not make this application horizontally scalable.
+- The embedded OAuth authorization server uses the official frozen
+  <code>@modelcontextprotocol/server-legacy</code> migration helpers. They are
+  appropriate for this single-user bridge but receive no new features; replace
+  them with a dedicated OAuth provider before expanding to managed or
+  multi-user service.
+- An authorized client can request all registered tools and send output onward.
+- Read-only WHOOP access still exposes sensitive, health-adjacent information.
+- Self-hosting and encryption do not make a deployment automatically secure,
+  private, HIPAA compliant, or compliant with other laws.
+
+See [docs/architecture.md](docs/architecture.md) for component/data flow and
+[docs/deployment.md](docs/deployment.md) for host-specific operating guidance.

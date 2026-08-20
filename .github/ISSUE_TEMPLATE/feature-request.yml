@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a change that fits the single-user, read-only project scope.
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What owner-controlled workflow is difficult today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe behavior, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Project boundaries
+      options:
+        - label: The proposal remains single-user and self-hosted.
+          required: true
+        - label: The proposal does not write to WHOOP or make medical/clearance claims.
+          required: true
+        - label: I considered privacy, retention, OAuth, and client compatibility effects.
+          required: true

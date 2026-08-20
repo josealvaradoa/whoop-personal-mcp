@@ -1,0 +1,20 @@
+# The project currently has one maintainer. This requests review but branch
+# protection intentionally does not require self-approval until another active
+# maintainer is appointed. See GOVERNANCE.md.
+* @josealvaradoa
+
+# Security-, release-, and protocol-sensitive surfaces are listed explicitly so
+# future maintainer expansion can require code-owner review for these paths.
+/.github/ @josealvaradoa
+/src/server.ts @josealvaradoa
+/src/whoop/ @josealvaradoa
+/src/db/ @josealvaradoa
+/src/mcp/ @josealvaradoa
+/Dockerfile @josealvaradoa
+/compose.yaml @josealvaradoa
+/package.json @josealvaradoa
+/pnpm-lock.yaml @josealvaradoa
+/server.json @josealvaradoa
+/SECURITY.md @josealvaradoa
+/PRIVACY.md @josealvaradoa
+/DISCLAIMER.md @josealvaradoa
