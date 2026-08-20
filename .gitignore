@@ -2,7 +2,14 @@ node_modules/
 dist/
 data/
 .env
+.env.*
+!.env.example
 whoop-mcp.config.json
+.pnpm-store/
+coverage/
+*.log
+*.tgz
+.DS_Store
 
 # Planning artifacts
 .claude/

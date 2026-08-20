@@ -1,0 +1,6 @@
+# Copy this table to ~/.codex/config.toml.
+[mcp_servers.whoop_personal]
+url = "https://YOUR-HOST.example/mcp"
+
+# Static-token alternative:
+# bearer_token_env_var = "WHOOP_PERSONAL_MCP_TOKEN"

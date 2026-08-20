@@ -1,0 +1,7 @@
+# Copy this table to ~/.grok/config.toml.
+# Grok starts MCP OAuth in a browser on first use.
+[mcp_servers.whoop_personal]
+url = "https://YOUR-HOST.example/mcp"
+
+# Static-token alternative:
+# headers = { Authorization = "Bearer ${WHOOP_PERSONAL_MCP_TOKEN}" }

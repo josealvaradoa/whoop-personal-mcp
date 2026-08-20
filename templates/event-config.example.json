@@ -1,0 +1,13 @@
+{
+  "event": {
+    "name": "REPLACE WITH YOUR TARGET EVENT",
+    "date": "2030-12-31",
+    "phases": [
+      { "name": "foundation", "start": "2030-01-01", "end": "2030-04-30" },
+      { "name": "build", "start": "2030-05-01", "end": "2030-09-30" },
+      { "name": "specific", "start": "2030-10-01", "end": "2030-11-30" },
+      { "name": "taper", "start": "2030-12-01", "end": "2030-12-27" },
+      { "name": "event_week", "start": "2030-12-28", "end": "2030-12-31" }
+    ]
+  }
+}

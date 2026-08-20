@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "servers": {
+      "whoop-personal": {
+        "url": "https://YOUR-HOST.example/mcp",
+        "transport": "streamable-http",
+        "auth": "oauth"
+      }
+    }
+  }
+}
