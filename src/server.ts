@@ -450,7 +450,13 @@ function fetchPinnedCimdJson(url: URL, address: LookupAddress): Promise<{
       },
       // Pin the already-vetted address so a second DNS answer cannot rebind
       // this request to loopback, link-local, or a private service.
-      lookup: (_hostname, _options, callback) => callback(null, address.address, address.family),
+      lookup: (_hostname, options, callback) => {
+        if (options.all) {
+          callback(null, [{ address: address.address, family: address.family }]);
+          return;
+        }
+        callback(null, address.address, address.family);
+      },
     }, (response) => {
       if (response.statusCode !== 200) {
         response.resume();
