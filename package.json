@@ -79,7 +79,7 @@
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",
     "@modelcontextprotocol/node": "2.0.0",
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.1.0",
     "@modelcontextprotocol/server-legacy": "2.0.0",
     "better-sqlite3": "13.0.3",
     "dotenv": "17.4.2",
