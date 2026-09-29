@@ -43,6 +43,7 @@ function queueCimdResponse(
   },
   requestedClientId = CLIENT_ID,
   statusCode = 200,
+  useAllLookup = false,
 ): void {
   const requestedUrl = new URL(requestedClientId);
   mocks.httpsRequest.mockImplementationOnce((options: Record<string, unknown>, callback: (res: FakeResponse) => void) => {
@@ -74,15 +75,31 @@ function queueCimdResponse(
       servername: requestedUrl.hostname,
     });
     expect(typeof options.lookup).toBe("function");
-    (options.lookup as Function)(requestedUrl.hostname, {}, (
-      error: Error | null,
-      address: string,
-      family: number,
-    ) => {
-      expect(error).toBeNull();
-      expect(address).toBe("8.8.8.8");
-      expect(family).toBe(4);
-    });
+    if (useAllLookup) {
+      const lookupCallback = vi.fn((
+        error: Error | null,
+        addresses: Array<{ address: string; family: number }>,
+        family: number | undefined,
+      ) => {
+        expect(error).toBeNull();
+        expect(addresses).toEqual([{ address: "8.8.8.8", family: 4 }]);
+        expect(family).toBeUndefined();
+      });
+      (options.lookup as Function)(requestedUrl.hostname, { all: true }, lookupCallback);
+      expect(lookupCallback).toHaveBeenCalledTimes(1);
+    } else {
+      const lookupCallback = vi.fn((
+        error: Error | null,
+        address: string,
+        family: number,
+      ) => {
+        expect(error).toBeNull();
+        expect(address).toBe("8.8.8.8");
+        expect(family).toBe(4);
+      });
+      (options.lookup as Function)(requestedUrl.hostname, { all: false }, lookupCallback);
+      expect(lookupCallback).toHaveBeenCalledTimes(1);
+    }
     return req;
   });
 }
@@ -145,6 +162,21 @@ describe("MCP 2026-07-28 Client ID Metadata Documents", () => {
     const second = await authorize(app);
     expect(second.status).toBe(200);
     expect(mocks.dnsLookup).toHaveBeenCalledTimes(1);
+    expect(mocks.httpsRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it("supports Node's all-address lookup callback while keeping the request pinned", async () => {
+    const clientId = "https://all-lookup.example/mcp-client.json";
+    mocks.dnsLookup.mockResolvedValue([{ address: "8.8.8.8", family: 4 }]);
+    queueCimdResponse(validCimd(clientId), {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    }, clientId, 200, true);
+
+    const res = await authorize(app, clientId);
+
+    expect(res.status).toBe(200);
+    expect(extractConsentId(res.text)).toBeTruthy();
     expect(mocks.httpsRequest).toHaveBeenCalledTimes(1);
   });
 
