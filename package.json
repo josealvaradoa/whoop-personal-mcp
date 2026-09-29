@@ -79,7 +79,7 @@
   "dependencies": {
     "@modelcontextprotocol/express": "2.0.0",
     "@modelcontextprotocol/node": "2.0.0",
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.1.0",
     "@modelcontextprotocol/server-legacy": "2.0.0",
     "better-sqlite3": "13.0.3",
     "dotenv": "17.4.2",
@@ -95,12 +95,12 @@
     "@typescript-eslint/eslint-plugin": "^8.57.1",
     "@typescript-eslint/parser": "^8.57.1",
     "@types/supertest": "^7.2.1",
-    "eslint": "^10.1.0",
+    "eslint": "^10.11.0",
     "supertest": "^7.1.4",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "undici": "6.28.0",
-    "vitest": "^3.2.4"
+    "undici": "8.11.2",
+    "vitest": "^5.0.2"
   },
   "pnpm": {
     "overrides": {
