@@ -17,8 +17,8 @@ importers:
   .:
     dependencies:
       '@modelcontextprotocol/express':
-        specifier: 2.0.0
-        version: 2.0.0(@modelcontextprotocol/server@2.1.0)(express@5.2.1)
+        specifier: 2.0.1
+        version: 2.0.1(@modelcontextprotocol/server@2.1.0)(express@5.2.1)
       '@modelcontextprotocol/node':
         specifier: 2.0.0
         version: 2.0.0(@modelcontextprotocol/server@2.1.0)(hono@4.13.3)
@@ -335,11 +335,11 @@ packages:
     resolution: {integrity: sha512-YdFj5gMRHr0gYNAhTbQDgjLHiEJdIAUYxomhKseUNye7ZGlISQmUoLh2sveFFCiQ7j2YMffT1kgSND0FSfIFjQ==}
     engines: {node: '>=20'}
 
-  '@modelcontextprotocol/express@2.0.0':
-    resolution: {integrity: sha512-Snlr8j9FR9LcVvEJPF7qJ7d5zTL4Bes2dk7RcacN9eSZ7OLohwxqhEvWu1+UxELyScgLbLLOdeVEGdwKI1iwVQ==}
+  '@modelcontextprotocol/express@2.0.1':
+    resolution: {integrity: sha512-ufZbY2kxdJH5sJqMMG+trJOKhob7qDzoh9elVu/TYaKIMBChm9GfF8aee/zj1yOb3yXHiP0qYDcuauVvNGyB6A==}
     engines: {node: '>=20'}
     peerDependencies:
-      '@modelcontextprotocol/server': ^2.0.0
+      '@modelcontextprotocol/server': ^2.1.0
       express: ^4.18.0 || ^5.0.0
 
   '@modelcontextprotocol/node@2.0.0':
@@ -698,10 +698,6 @@ packages:
     resolution: {integrity: sha512-/Nf7TyzTx6S3yRJObOAV7956r8cr2+Oj8AC5dt8wSP3BQAoeX58NoHyCU8P8zGkNXStjTSi6fzO6F0pBdcYbEg==}
     engines: {node: '>= 0.8'}
 
-  cac@6.7.14:
-    resolution: {integrity: sha512-b6Ilus+c3RrdDk+JhLKUAQfzzgLEPy6wcXqS7f/xe1EETvsDP6GORG7SFuOs6cID5YkqchW/LXZbX5bc8j7ZcQ==}
-    engines: {node: '>=8'}
-
   cacheable@2.5.0:
     resolution: {integrity: sha512-60cyAOytib/OzBw1JNSoSV/boK1AtHryDIjvVBk7XbN4ugfkM3+Sry7fEjNgPMGgOjuaZPAp8ruZ0Cxafwyq9g==}
 
@@ -1049,12 +1045,6 @@ packages:
 
   jose@6.2.9:
     resolution: {integrity: sha512-XrchZOFZUl/T3vTwRe8XK+cJrGtMF4th1ARnDfwbBXFKThGhlsxEE4Zu03AD/bjJSt/9jT/mxrOCkJWOg77aPA==}
-
-  js-tokens@9.0.1:
-    resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
-
-  json-buffer@3.0.1:
-    resolution: {integrity: sha512-4bV5BfR2mqfQTJm+V5tPPdf+ZpuhiIvTuAB5g8kcrXOZpTT/QwwVRWBywX1ozr6lEuPdbHxwaJlm9G6mI2sfSQ==}
 
   json-schema-traverse@0.4.1:
     resolution: {integrity: sha512-xbbCH5dCYU5T8LcEhhuh7HJ88HXuW3qsI3Y0zOZFKfZEHcpWiHU/Jxzk629Brsab/mMiHQti9wMP+845RPe3Vg==}
@@ -1639,7 +1629,7 @@ snapshots:
     dependencies:
       zod: 4.4.3
 
-  '@modelcontextprotocol/express@2.0.0(@modelcontextprotocol/server@2.1.0)(express@5.2.1)':
+  '@modelcontextprotocol/express@2.0.1(@modelcontextprotocol/server@2.1.0)(express@5.2.1)':
     dependencies:
       '@modelcontextprotocol/server': 2.1.0
       cors: 2.8.6
@@ -1980,8 +1970,6 @@ snapshots:
       balanced-match: 4.0.4
 
   bytes@3.1.2: {}
-
-  cac@6.7.14: {}
 
   cacheable@2.5.0:
     dependencies:
@@ -2374,10 +2362,6 @@ snapshots:
   isexe@2.0.0: {}
 
   jose@6.2.9: {}
-
-  js-tokens@9.0.1: {}
-
-  json-buffer@3.0.1: {}
 
   json-schema-traverse@0.4.1: {}
 
